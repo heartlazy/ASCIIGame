@@ -1,0 +1,34 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8888,
+    "connection_timeout": 5
+  },
+  "stress_test": {
+    "concurrent_clients": 50,
+    "test_duration_seconds": 30,
+    "rapid_connections_count": 500,
+    "rapid_connections_interval_ms": 10,
+    "flood_clients": 20,
+    "flood_messages_per_client": 100
+  },
+  "robustness_test": {
+    "connection_flood_max": 300,
+    "slow_client_delay_seconds": 0.5,
+    "rapid_disconnect_count": 100,
+    "concurrent_login_count": 5,
+    "race_condition_threads": 10
+  },
+  "performance_monitor": {
+    "interval_seconds": 1.0,
+    "worker_threads": 5,
+    "metrics_window_size": 100
+  },
+  "thresholds": {
+    "connection_success_rate_min": 95.0,
+    "avg_latency_ms_max": 50.0,
+    "p95_latency_ms_max": 100.0,
+    "p99_latency_ms_max": 200.0,
+    "error_rate_max": 5.0
+  }
+}
