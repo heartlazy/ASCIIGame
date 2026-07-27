@@ -385,7 +385,8 @@ func (r *Room) broadcastState() {
 	timestamp := nowMS()
 	poison := r.poisonRadius
 
-	var players []string
+	var pb, ib strings.Builder
+	firstPlayer := true
 	for i := 0; i < config.MaxRoomPlayers; i++ {
 		id := r.playerIDs[i]
 		if id < 0 {
@@ -396,27 +397,35 @@ func (r *Room) broadcastState() {
 			continue
 		}
 		p.mu.Lock()
+		if !firstPlayer {
+			pb.WriteByte(';')
+		}
 		shield := 0
 		if p.hasShield {
 			shield = 1
 		}
-		players = append(players, fmt.Sprintf("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+		fmt.Fprintf(&pb, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
 			p.id, p.x, p.y, p.hp, p.atk, p.def, int(p.status), shield,
 			int(p.inventory[0]), int(p.inventory[1]), int(p.inventory[2]),
-			int(p.inventory[3]), int(p.inventory[4])))
+			int(p.inventory[3]), int(p.inventory[4]))
 		p.mu.Unlock()
+		firstPlayer = false
 	}
 
-	var items []string
+	firstItem := true
 	for i := 0; i < r.itemCount; i++ {
 		if !r.items[i].active {
 			continue
 		}
-		items = append(items, fmt.Sprintf("%d,%d,%d", r.items[i].x, r.items[i].y, int(r.items[i].typ)))
+		if !firstItem {
+			ib.WriteByte(';')
+		}
+		fmt.Fprintf(&ib, "%d,%d,%d", r.items[i].x, r.items[i].y, int(r.items[i].typ))
+		firstItem = false
 	}
 	r.mu.Unlock()
 
-	r.broadcast(protocol.BuildGameState(timestamp, strings.Join(players, ";"), strings.Join(items, ";"), poison))
+	r.broadcast(protocol.BuildGameState(timestamp, pb.String(), ib.String(), poison))
 }
 
 // gameLoop is the per-room game goroutine, mirroring game_thread_func

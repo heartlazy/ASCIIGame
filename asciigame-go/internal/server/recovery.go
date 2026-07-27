@@ -169,6 +169,19 @@ func (s *Server) restorePlayerToGame(p *Player, origID int) *Room {
 		go room.gameLoop()
 	}
 	delete(s.recByUser, p.getUsername())
+
+	// If all expected players have reconnected, clean up the pending entry.
+	allReconnected := true
+	for _, rp := range pr.players {
+		if _, still := s.recByUser[rp.username]; still {
+			allReconnected = false
+			break
+		}
+	}
+	if allReconnected {
+		delete(s.pending, pr.originalRoomID)
+		delete(s.recRoomByOrig, pr.originalRoomID)
+	}
 	s.recMu.Unlock()
 
 	// Place the player in a free slot.
