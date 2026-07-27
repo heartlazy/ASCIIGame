@@ -129,10 +129,11 @@ func (s *State) addMessage(sender, text string) {
 
 // Thread-safe accessors used by the UI and tests.
 
-func (s *State) RoomID() int      { s.mu.Lock(); defer s.mu.Unlock(); return s.roomID }
-func (s *State) InGame() bool     { s.mu.Lock(); defer s.mu.Unlock(); return s.inGame }
-func (s *State) MyID() int        { s.mu.Lock(); defer s.mu.Unlock(); return s.myID }
-func (s *State) PlayerCount() int { s.mu.Lock(); defer s.mu.Unlock(); return len(s.players) }
+func (s *State) RoomID() int        { s.mu.Lock(); defer s.mu.Unlock(); return s.roomID }
+func (s *State) InGame() bool       { s.mu.Lock(); defer s.mu.Unlock(); return s.inGame }
+func (s *State) MyID() int          { s.mu.Lock(); defer s.mu.Unlock(); return s.myID }
+func (s *State) PlayerCount() int   { s.mu.Lock(); defer s.mu.Unlock(); return len(s.players) }
+func (s *State) MessageCount() int  { s.mu.Lock(); defer s.mu.Unlock(); return len(s.messages) }
 
 // Update parses one server frame and mutates state, mirroring
 // game_update_from_server (client/game.c:603-653). It returns true if the UI

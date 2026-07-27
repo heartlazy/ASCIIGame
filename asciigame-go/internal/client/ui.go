@@ -3,6 +3,8 @@ package client
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/heartlazyli/asciigame/internal/config"
@@ -25,7 +27,8 @@ type UI struct {
 	help   *tview.TextView
 	game   *tview.Flex
 
-	username string
+	username  string
+	connected atomic.Bool
 }
 
 // NewUI builds the UI targeting server addr (host:port).
@@ -51,18 +54,18 @@ func (u *UI) buildLoginPage() {
 	form := tview.NewForm()
 	form.AddInputField("Username", "", 20, nil, func(t string) { username = t }).
 		AddPasswordField("Password", "", 20, '*', func(t string) { password = t }).
-		AddButton("Login", func() { u.connectAndAuth(username, password, false) }).
-		AddButton("Register", func() { u.connectAndAuth(username, password, true) }).
+		AddButton("Login", func() { u.doLogin(username, password) }).
+		AddButton("Register+Login", func() { u.doRegisterAndLogin(username, password) }).
 		AddButton("Quit", func() { u.app.Stop() })
-	form.SetBorder(true).SetTitle(" ASCII Battle Royale — Login ").SetTitleAlign(tview.AlignCenter)
+	form.SetBorder(true).SetTitle(" ASCII Battle Royale ").SetTitleAlign(tview.AlignCenter)
 
-	// Center the form in the terminal.
+	// Give the form enough height for 2 fields + 3 buttons + border + title.
 	flex := tview.NewFlex().
 		AddItem(nil, 0, 1, false).
 		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
 			AddItem(nil, 0, 1, false).
-			AddItem(form, 11, 1, true).
-			AddItem(nil, 0, 1, false), 40, 1, true).
+			AddItem(form, 13, 1, true).
+			AddItem(nil, 0, 1, false), 50, 1, true).
 		AddItem(nil, 0, 1, false)
 	u.pages.AddPage("login", flex, true, true)
 }
@@ -85,36 +88,134 @@ func (u *UI) buildGamePage() {
 	u.pages.AddPage("game", u.game, true, false)
 }
 
-// connectAndAuth dials (once), starts the read loop, and sends REGISTER+LOGIN
-// or just LOGIN, mirroring client/main.c's post-login-screen flow.
-func (u *UI) connectAndAuth(username, password string, register bool) {
+// ensureConn establishes the TCP connection (once) and starts the read loop.
+func (u *UI) ensureConn() error {
+	if u.conn != nil {
+		return nil
+	}
+	c, err := Dial(u.addr)
+	if err != nil {
+		return err
+	}
+	u.conn = c
+	u.connected.Store(true)
+	go u.conn.ReadLoop(u.onMsg, u.onClose)
+	return nil
+}
+
+// doLogin connects and sends LOGIN, then waits for server response before
+// transitioning to the game page. Shows an error modal on failure.
+func (u *UI) doLogin(username, password string) {
 	if username == "" || password == "" {
 		u.showModal("Username and password required.")
 		return
 	}
-	if u.conn == nil {
-		c, err := Dial(u.addr)
-		if err != nil {
-			u.showModal(fmt.Sprintf("Failed to connect: %v", err))
-			return
-		}
-		u.conn = c
-		go u.conn.ReadLoop(u.onMsg, u.onClose)
+	if err := u.ensureConn(); err != nil {
+		u.showModal(fmt.Sprintf("Failed to connect: %v", err))
+		return
+	}
+	_ = u.conn.Send(protocol.BuildLogin(username, password))
+
+	// Wait briefly for the server response (the read goroutine updates state).
+	u.username = username
+	u.state.mu.Lock()
+	u.state.username = username
+	u.state.mu.Unlock()
+
+	go u.waitForLoginResult(username)
+}
+
+// doRegisterAndLogin sends REGISTER, waits for success, then sends LOGIN.
+func (u *UI) doRegisterAndLogin(username, password string) {
+	if username == "" || password == "" {
+		u.showModal("Username and password required.")
+		return
+	}
+	if err := u.ensureConn(); err != nil {
+		u.showModal(fmt.Sprintf("Failed to connect: %v", err))
+		return
 	}
 	u.username = username
 	u.state.mu.Lock()
 	u.state.username = username
-	u.state.loggedIn = true
 	u.state.mu.Unlock()
 
-	if register {
-		_ = u.conn.Send(protocol.BuildRegister(username, password))
-	}
-	_ = u.conn.Send(protocol.BuildLogin(username, password))
+	_ = u.conn.Send(protocol.BuildRegister(username, password))
 
-	u.pages.SwitchToPage("game")
-	u.app.SetFocus(u.game)
-	u.render()
+	// Wait for register response, then login.
+	go func() {
+		if !u.waitForResponse("Registration successful", "Register failed") {
+			return
+		}
+		_ = u.conn.Send(protocol.BuildLogin(username, password))
+		u.waitForLoginResult(username)
+	}()
+}
+
+// waitForLoginResult polls state for up to 3s to see if login succeeded (myID
+// was set by the OK handler), or if an error message appeared.
+func (u *UI) waitForLoginResult(username string) {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		u.state.mu.Lock()
+		id := u.state.myID
+		msgs := u.state.messages
+		u.state.mu.Unlock()
+		if id > 0 {
+			// Login succeeded — switch to game page on the UI thread.
+			u.state.mu.Lock()
+			u.state.loggedIn = true
+			u.state.mu.Unlock()
+			u.app.QueueUpdateDraw(func() {
+				u.pages.SwitchToPage("game")
+				u.app.SetFocus(u.game)
+				u.render()
+			})
+			return
+		}
+		// Check if an error appeared.
+		if len(msgs) > 0 {
+			last := msgs[len(msgs)-1]
+			if last.sender == "Error" {
+				u.app.QueueUpdateDraw(func() {
+					u.showModal("Login failed: " + last.text)
+				})
+				return
+			}
+		}
+	}
+	u.app.QueueUpdateDraw(func() {
+		u.showModal("Login timed out — no server response.")
+	})
+}
+
+// waitForResponse polls state for up to 3s for a message containing success,
+// or shows failMsg on error. Returns true if success was found.
+func (u *UI) waitForResponse(successSubstr, failMsg string) bool {
+	deadline := time.Now().Add(3 * time.Second)
+	startMsgCount := u.state.MessageCount()
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		u.state.mu.Lock()
+		msgs := u.state.messages
+		u.state.mu.Unlock()
+		for i := startMsgCount; i < len(msgs); i++ {
+			if msgs[i].sender == "Error" {
+				u.app.QueueUpdateDraw(func() {
+					u.showModal(failMsg + ": " + msgs[i].text)
+				})
+				return false
+			}
+			if strings.Contains(msgs[i].text, successSubstr) {
+				return true
+			}
+		}
+	}
+	u.app.QueueUpdateDraw(func() {
+		u.showModal(failMsg + ": timed out")
+	})
+	return false
 }
 
 // onMsg runs on the read goroutine: update state, then redraw on the UI thread.
@@ -125,6 +226,7 @@ func (u *UI) onMsg(raw string) {
 }
 
 func (u *UI) onClose() {
+	u.connected.Store(false)
 	u.app.QueueUpdateDraw(func() {
 		u.state.mu.Lock()
 		u.state.addMessage("System", "Connection lost! Press Q to quit.")
@@ -135,15 +237,22 @@ func (u *UI) onClose() {
 
 // onKey dispatches key presses by game phase, mirroring the C handle_*_input.
 func (u *UI) onKey(ev *tcell.EventKey) *tcell.EventKey {
+	// ESC always quits from any state.
+	if ev.Key() == tcell.KeyEscape {
+		u.app.Stop()
+		return nil
+	}
+
 	u.state.mu.Lock()
 	inGame, inRoom := u.state.inGame, u.state.inRoom
 	u.state.mu.Unlock()
 
 	r := ev.Rune()
-	switch {
-	case r == 'q' || r == 'Q':
-		u.app.Stop()
-		return nil
+	if r == 'q' || r == 'Q' {
+		if !inGame {
+			u.app.Stop()
+			return nil
+		}
 	}
 
 	switch {
@@ -188,6 +297,8 @@ func (u *UI) gameKey(ev *tcell.EventKey) {
 		u.send(protocol.BuildAttack())
 	case '1', '2', '3', '4', '5':
 		u.send(protocol.BuildUseItem(int(ev.Rune() - '1')))
+	case 'q', 'Q':
+		u.send(protocol.BuildSimple("LEAVE_ROOM"))
 	case 't', 'T':
 		u.prompt("Chat", func(text string) {
 			if strings.TrimSpace(text) != "" {
@@ -215,7 +326,12 @@ func (u *UI) roomKey(ev *tcell.EventKey) {
 func (u *UI) lobbyKey(ev *tcell.EventKey) {
 	switch ev.Rune() {
 	case 'c', 'C':
-		u.send(protocol.BuildCreateRoom("Room", 6))
+		u.prompt("Room name", func(name string) {
+			if strings.TrimSpace(name) == "" {
+				name = "Room"
+			}
+			u.send(protocol.BuildCreateRoom(name, 6))
+		})
 	case 'l', 'L':
 		u.send(protocol.BuildSimple("LIST_ROOMS"))
 	case 'j', 'J':
@@ -228,7 +344,7 @@ func (u *UI) lobbyKey(ev *tcell.EventKey) {
 }
 
 func (u *UI) send(frame string) {
-	if u.conn != nil {
+	if u.conn != nil && u.connected.Load() {
 		_ = u.conn.Send(frame)
 	}
 }
@@ -298,7 +414,7 @@ func (u *UI) renderStatus(s *snapshot) {
 
 func (u *UI) renderWorld(s *snapshot) {
 	if !s.inGame {
-		u.world.SetText("\n   Waiting for game to start...\n\n   Lobby: [C]reate room  [J]oin  [L]ist rooms  [Q]uit\n   Room:  [R]eady  [T]chat  [L]eave")
+		u.world.SetText("\n   Waiting for game to start...\n\n   Lobby: [C]reate room  [J]oin  [L]ist rooms\n   Room:  [R]eady  [T]chat  [L]eave\n   [Q]/[ESC] Quit")
 		return
 	}
 	// Base grid from the template.
@@ -376,11 +492,11 @@ func (u *UI) renderMessages(msgs []chatMessage) {
 func (u *UI) renderHelp(s *snapshot) {
 	switch {
 	case s.inGame:
-		u.help.SetText("[white]WASD/↑↓←→[-] Move  [white]J/Space[-] Attack  [white]1-5[-] Item  [white]T[-] Chat  [white]Q[-] Quit")
+		u.help.SetText("[white]WASD/Arrows[-] Move  [white]J/Space[-] Attack  [white]1-5[-] Item  [white]T[-] Chat  [white]Q[-] Leave")
 	case s.inRoom:
-		u.help.SetText("[white]R[-] Ready  [white]T[-] Chat  [white]L[-] Leave  [white]Q[-] Quit")
+		u.help.SetText("[white]R[-] Ready  [white]T[-] Chat  [white]L[-] Leave  [white]Q/ESC[-] Quit")
 	default:
-		u.help.SetText("[white]C[-] Create  [white]J[-] Join  [white]L[-] List rooms  [white]Q[-] Quit")
+		u.help.SetText("[white]C[-] Create  [white]J[-] Join  [white]L[-] List rooms  [white]Q/ESC[-] Quit")
 	}
 }
 
