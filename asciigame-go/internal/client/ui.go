@@ -91,6 +91,7 @@ func (u *UI) buildGamePage() {
 	u.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 		// Only intercept when on the game page (not login, prompt, or modal).
 		name, _ := u.pages.GetFrontPage()
+		debugf("app input: frontPage=%q rune=%q key=%v", name, ev.Rune(), ev.Key())
 		if name != "game" {
 			return ev
 		}
@@ -230,6 +231,7 @@ func (u *UI) waitForResponse(successSubstr, failMsg string) bool {
 
 // onMsg runs on the read goroutine: update state, then redraw on the UI thread.
 func (u *UI) onMsg(raw string) {
+	debugf("recv %q", raw)
 	if u.state.Update(raw) {
 		u.app.QueueUpdateDraw(u.render)
 	}
@@ -258,6 +260,7 @@ func (u *UI) onKey(ev *tcell.EventKey) *tcell.EventKey {
 	u.state.mu.Unlock()
 
 	r := ev.Rune()
+	debugf("onKey rune=%q key=%v inGame=%v inRoom=%v", r, ev.Key(), inGame, inRoom)
 	if r == 'q' || r == 'Q' {
 		if !inGame {
 			u.app.Stop()
@@ -358,8 +361,12 @@ func (u *UI) lobbyKey(ev *tcell.EventKey) {
 }
 
 func (u *UI) send(frame string) {
-	if u.conn != nil && u.connected.Load() {
-		_ = u.conn.Send(frame)
+	connected := u.conn != nil && u.connected.Load()
+	debugf("send frame=%q connected=%v", frame, connected)
+	if connected {
+		if err := u.conn.Send(frame); err != nil {
+			debugf("send error: %v", err)
+		}
 	}
 }
 
