@@ -104,3 +104,40 @@ func waitUntil(cond func() bool) bool {
 	}
 	return cond()
 }
+
+// TestClientRoomListAndJoin verifies that the client state correctly processes
+// ROOM_LIST and JOIN_ROOM interactions.
+func TestClientRoomListAndJoin(t *testing.T) {
+	addr := startServer(t)
+
+	a := newPeer(t, addr)
+	b := newPeer(t, addr)
+
+	_ = a.conn.Send(protocol.BuildRegister("alice", "pw"))
+	_ = a.conn.Send(protocol.BuildLogin("alice", "pw"))
+	_ = b.conn.Send(protocol.BuildRegister("bob", "pw"))
+	_ = b.conn.Send(protocol.BuildLogin("bob", "pw"))
+
+	if !waitUntil(func() bool { return a.state.MyID() > 0 }) {
+		t.Fatalf("alice never got myID")
+	}
+
+	// alice creates a room
+	_ = a.conn.Send(protocol.BuildCreateRoom("TestRoom", 6))
+	if !waitUntil(func() bool { return a.state.RoomID() > 0 }) {
+		t.Fatalf("alice never entered room")
+	}
+
+	// bob lists rooms — should see alice's room in messages
+	_ = b.conn.Send(protocol.BuildSimple("LIST_ROOMS"))
+	if !waitUntil(func() bool { return b.state.HasMessage("TestRoom") }) {
+		t.Fatalf("bob never saw TestRoom in list")
+	}
+
+	// bob joins the room
+	roomID := a.state.RoomID()
+	_ = b.conn.Send(protocol.BuildJoinRoom(roomID))
+	if !waitUntil(func() bool { return b.state.RoomID() == roomID }) {
+		t.Fatalf("bob never joined room %d, got roomID=%d", roomID, b.state.RoomID())
+	}
+}

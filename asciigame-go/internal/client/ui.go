@@ -84,8 +84,18 @@ func (u *UI) buildGamePage() {
 		AddItem(u.world, config.MapHeight+2, 0, false).
 		AddItem(u.msgs, 0, 1, false).
 		AddItem(u.help, 1, 0, false)
-	u.game.SetInputCapture(u.onKey)
 	u.pages.AddPage("game", u.game, true, false)
+
+	// Capture input at the app level so keys work regardless of which child
+	// widget has focus within the game page.
+	u.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		// Only intercept when on the game page (not login, prompt, or modal).
+		name, _ := u.pages.GetFrontPage()
+		if name != "game" {
+			return ev
+		}
+		return u.onKey(ev)
+	})
 }
 
 // ensureConn establishes the TCP connection (once) and starts the read loop.
@@ -333,7 +343,11 @@ func (u *UI) lobbyKey(ev *tcell.EventKey) {
 			u.send(protocol.BuildCreateRoom(name, 6))
 		})
 	case 'l', 'L':
+		u.state.mu.Lock()
+		u.state.addMessage("System", "Requesting room list...")
+		u.state.mu.Unlock()
 		u.send(protocol.BuildSimple("LIST_ROOMS"))
+		u.render()
 	case 'j', 'J':
 		u.prompt("Room ID", func(text string) {
 			if id := atoi(text); id > 0 {

@@ -135,6 +135,18 @@ func (s *State) MyID() int          { s.mu.Lock(); defer s.mu.Unlock(); return s
 func (s *State) PlayerCount() int   { s.mu.Lock(); defer s.mu.Unlock(); return len(s.players) }
 func (s *State) MessageCount() int  { s.mu.Lock(); defer s.mu.Unlock(); return len(s.messages) }
 
+// HasMessage reports whether any message contains substr in its text.
+func (s *State) HasMessage(substr string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.messages {
+		if strings.Contains(m.text, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 // Update parses one server frame and mutates state, mirroring
 // game_update_from_server (client/game.c:603-653). It returns true if the UI
 // should redraw.
