@@ -81,7 +81,7 @@ func (u *UI) buildGamePage() {
 
 	u.game = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(u.status, 4, 0, false).
-		AddItem(u.world, config.MapHeight+2, 0, false).
+		AddItem(u.world, 8, 0, false). // starts in lobby; render() grows it to 22 in game
 		AddItem(u.msgs, 0, 1, false).
 		AddItem(u.help, 1, 0, false)
 	u.pages.AddPage("game", u.game, true, false)
@@ -404,6 +404,14 @@ func (u *UI) showModal(text string) {
 // render rebuilds all panels from a state snapshot. Must run on the UI thread.
 func (u *UI) render() {
 	snap := u.state.Snapshot()
+	// Adapt the layout so the Messages panel is always visible. In the lobby
+	// and room the Arena panel only shows hint text, so shrink it and give the
+	// space to Messages; in game it needs its full 22 rows for the map.
+	if snap.inGame {
+		u.game.ResizeItem(u.world, config.MapHeight+2, 0)
+	} else {
+		u.game.ResizeItem(u.world, 8, 0)
+	}
 	u.renderStatus(&snap)
 	u.renderWorld(&snap)
 	u.renderMessages(snap.messages)
