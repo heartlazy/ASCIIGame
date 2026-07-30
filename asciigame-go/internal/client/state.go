@@ -245,9 +245,10 @@ func (s *State) handleRoomList(msg protocol.Message) {
 		case "2":
 			status = "Gaming"
 		}
-		s.addMessage("", "  ["+f[0]+"] "+f[1]+" ("+f[2]+"/"+f[3]+") - "+status)
+		// Make the ID to type unambiguous (users mistook the name for the ID).
+		s.addMessage("", "  ID="+f[0]+"  name='"+f[1]+"'  ("+f[2]+"/"+f[3]+")  "+status)
 	}
-	s.addMessage("System", "Press J to join a room by ID")
+	s.addMessage("System", "Press J and enter the ID number (not the name) to join")
 }
 
 func (s *State) handleRoomInfo(msg protocol.Message) {

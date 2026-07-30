@@ -352,10 +352,19 @@ func (u *UI) lobbyKey(ev *tcell.EventKey) {
 		u.send(protocol.BuildSimple("LIST_ROOMS"))
 		u.render()
 	case 'j', 'J':
-		u.prompt("Room ID", func(text string) {
-			if id := atoi(text); id > 0 {
-				u.send(protocol.BuildJoinRoom(id))
+		u.prompt("Room ID (number)", func(text string) {
+			text = strings.TrimSpace(text)
+			id := atoi(text)
+			if id <= 0 {
+				// Give feedback instead of silently doing nothing — users
+				// often type the room name here by mistake.
+				u.state.mu.Lock()
+				u.state.addMessage("Error", "Enter the numeric room ID (e.g. 1), not the name. Press L to list.")
+				u.state.mu.Unlock()
+				u.render()
+				return
 			}
+			u.send(protocol.BuildJoinRoom(id))
 		})
 	}
 }
