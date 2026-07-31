@@ -139,7 +139,7 @@ func (s *Server) findPlayerByUsername(username string) *Player {
 // them. Mirrors handle_client_data + handle_disconnect (main.c).
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	p := s.registerPlayer(conn)
-	log.Printf("player %d connected", p.id)
+	log.Printf("player %s connected", p.label())
 
 	go p.writeLoop()
 
@@ -192,5 +192,5 @@ func (s *Server) disconnect(p *Player) {
 	s.unregisterPlayer(p)
 	p.closeOnce()
 	_ = p.conn.Close()
-	log.Printf("player %d disconnected", p.id)
+	log.Printf("player %s disconnected", p.label())
 }

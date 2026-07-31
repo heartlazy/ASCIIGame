@@ -151,7 +151,7 @@ func (r *Room) addPlayer(p *Player) int {
 	p.status = StatusInRoom
 	p.mu.Unlock()
 
-	log.Printf("player %d joined room %d", p.id, r.id)
+	log.Printf("player %s joined room %d", p.label(), r.id)
 	r.broadcast(protocol.BuildPlayerJoin(p.id, p.username))
 	return 0
 }

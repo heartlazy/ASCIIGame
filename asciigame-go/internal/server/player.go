@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -164,6 +165,17 @@ func (p *Player) getUsername() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.username
+}
+
+// label returns a human-friendly identifier for logs: the username once the
+// player has logged in, otherwise "#<id>" (before login there is no username).
+func (p *Player) label() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.username != "" {
+		return p.username
+	}
+	return fmt.Sprintf("#%d", p.id)
 }
 
 func (p *Player) setUsername(u string) {

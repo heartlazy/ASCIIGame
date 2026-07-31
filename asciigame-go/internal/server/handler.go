@@ -24,7 +24,7 @@ func (s *Server) handle(p *Player, msg protocol.Message) {
 	case protocol.CmdMove, protocol.CmdAttack, protocol.CmdUseItem:
 		// skip: these fire many times per second during play
 	default:
-		log.Printf("player %d cmd=%s args=%v", p.id, protocol.CmdName(msg.Type), msg.Args)
+		log.Printf("player %s cmd=%s args=%v", p.label(), protocol.CmdName(msg.Type), msg.Args)
 	}
 
 	switch msg.Type {
@@ -132,7 +132,7 @@ func (s *Server) handleListRooms(p *Player, _ protocol.Message) {
 	s.rmu.RLock()
 	n := len(s.rooms)
 	s.rmu.RUnlock()
-	log.Printf("player %d listed rooms: %d room(s)", p.id, n)
+	log.Printf("player %s listed rooms: %d room(s)", p.label(), n)
 	p.Send(list)
 }
 
@@ -181,17 +181,17 @@ func (s *Server) handleJoinRoom(p *Player, msg protocol.Message) {
 	}
 	room := s.findRoomByID(atoi(msg.Args[0]))
 	if room == nil {
-		log.Printf("player %d join failed: room %s not found", p.id, msg.Args[0])
+		log.Printf("player %s join failed: room %s not found", p.label(), msg.Args[0])
 		s.sendErr(p, config.ErrRoomNotFound, "Room not found")
 		return
 	}
 	switch room.addPlayer(p) {
 	case -1:
-		log.Printf("player %d join room %d failed: full", p.id, room.id)
+		log.Printf("player %s join room %d failed: full", p.label(), room.id)
 		s.sendErr(p, config.ErrRoomFull, "Room is full")
 		return
 	case -2:
-		log.Printf("player %d join room %d failed: game in progress", p.id, room.id)
+		log.Printf("player %s join room %d failed: game in progress", p.label(), room.id)
 		s.sendErr(p, config.ErrGameInProgress, "Game in progress")
 		return
 	}
