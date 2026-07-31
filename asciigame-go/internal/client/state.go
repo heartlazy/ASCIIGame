@@ -9,12 +9,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/heartlazyli/asciigame/internal/config"
 	"github.com/heartlazyli/asciigame/internal/protocol"
 )
 
 const maxMessages = 50
+
+// attackEffectMS is how long the attack-range highlight stays on screen after
+// an ATTACK event (mirrors ATTACK_EFFECT_DURATION_MS in client/game.h:16).
+const attackEffectMS = 300
+
+// nowMS returns the current time in milliseconds.
+func nowMS() int64 { return time.Now().UnixMilli() }
 
 // mapTemplate is the built-in map, identical to client/game.c:17-38 and the
 // server's template.
@@ -77,6 +85,14 @@ type State struct {
 	items       []itemView
 	poisonRadius int
 
+	// attackEffect: a transient highlight of the last attack's range, cleared
+	// after attackEffectMS. Mirrors the C AttackEffect (client/game.h:39-45).
+	attackActive   bool
+	attackX        int
+	attackY        int
+	attackRadius   int
+	attackExpireMS int64
+
 	messages []chatMessage
 }
 
@@ -102,6 +118,10 @@ type snapshot struct {
 	poisonRadius int
 	players      []playerView
 	items        []itemView
+	attackActive bool
+	attackX      int
+	attackY      int
+	attackRadius int
 	messages     []chatMessage
 }
 
@@ -109,13 +129,16 @@ type snapshot struct {
 func (s *State) Snapshot() snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Expire the attack effect if its window has passed.
+	attackActive := s.attackActive && nowMS() < s.attackExpireMS
 	return snapshot{
 		username: s.username, inRoom: s.inRoom, roomID: s.roomID, roomName: s.roomName,
 		isReady: s.isReady, inGame: s.inGame, myID: s.myID, myX: s.myX, myY: s.myY,
 		myHP: s.myHP, myMaxHP: s.myMaxHP, myATK: s.myATK, myDEF: s.myDEF,
 		myHasShield: s.myHasShield, inventory: s.inventory, poisonRadius: s.poisonRadius,
-		players:  append([]playerView(nil), s.players...),
-		items:    append([]itemView(nil), s.items...),
+		players:      append([]playerView(nil), s.players...),
+		items:        append([]itemView(nil), s.items...),
+		attackActive: attackActive, attackX: s.attackX, attackY: s.attackY, attackRadius: s.attackRadius,
 		messages: append([]chatMessage(nil), s.messages...),
 	}
 }
@@ -331,6 +354,15 @@ func (s *State) handleGameEvent(msg protocol.Message) {
 		return
 	}
 	switch msg.Args[0] {
+	case "ATTACK":
+		// Highlight the attacked area: ATTACK|attacker|x|y, range = AttackRange.
+		if len(msg.Args) >= 4 {
+			s.attackActive = true
+			s.attackX = atoi(msg.Args[2])
+			s.attackY = atoi(msg.Args[3])
+			s.attackRadius = config.AttackRange
+			s.attackExpireMS = nowMS() + attackEffectMS
+		}
 	case "ATTACK_RESULT":
 		if len(msg.Args) >= 3 && atoi(msg.Args[1]) == s.myID {
 			if atoi(msg.Args[2]) == 0 {

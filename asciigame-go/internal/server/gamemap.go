@@ -66,17 +66,20 @@ func mapIsWalkable(m *gameMap, x, y int) bool {
 // mapCenter mirrors map_get_center (map.c:87-94).
 func mapCenter() (int, int) { return config.MapWidth / 2, config.MapHeight / 2 }
 
-// mapIsInPoison mirrors map_is_in_poison (map.c:75-85): Chebyshev distance from
-// center greater than the radius means the cell is in the poison (dangerous).
+// mapIsInPoison reports whether (x,y) is outside the safe zone (i.e. in the
+// poison). It uses doubled coordinates so the safe zone is symmetric about the
+// true center — for even dimensions the geometric center falls between cells
+// (24.5, 9.5 on a 50x20 map), and using an integer center made the left/top
+// edges one step farther than the right/bottom, so they entered the poison
+// early. Comparing |2x-(W-1)| against 2*radius removes that asymmetry.
 func mapIsInPoison(x, y, radius int) bool {
-	cx, cy := mapCenter()
-	dx := abs(x - cx)
-	dy := abs(y - cy)
+	dx := abs(2*x - (config.MapWidth - 1))
+	dy := abs(2*y - (config.MapHeight - 1))
 	dist := dx
 	if dy > dx {
 		dist = dy
 	}
-	return dist > radius
+	return dist > 2*radius
 }
 
 // mapDistance mirrors map_distance (map.c:144-146): Manhattan distance.

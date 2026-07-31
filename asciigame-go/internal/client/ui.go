@@ -488,19 +488,33 @@ func (u *UI) renderWorld(s *snapshot) {
 			out[it.y][it.x] = "[yellow]" + string(itemChar(it.typ)) + "[-]"
 		}
 	}
-	// Players overlay: self green, others (alive) white, dead dim.
+	// Attack-range overlay: briefly paint the blast area (Manhattan radius) on
+	// empty cells so items/players drawn on top stay visible.
+	if s.attackActive {
+		for y := 0; y < config.MapHeight; y++ {
+			for x := 0; x < config.MapWidth; x++ {
+				if out[y][x] == " " && manhattan(s.attackX, s.attackY, x, y) <= s.attackRadius {
+					out[y][x] = "[-:red] [-:-]"
+				}
+			}
+		}
+	}
+	// Players overlay: self is a green '@'; others are letters (A, B, C, ...)
+	// derived from their id so they can be told apart. Dead players are dim.
 	for _, p := range s.players {
 		if !inBounds(p.x, p.y) {
 			continue
 		}
-		color := "white"
 		if p.id == s.myID {
-			color = "green"
+			out[p.y][p.x] = "[green]@[-]"
+			continue
 		}
+		ch := byte('A' + (p.id-1)%26)
+		color := "white"
 		if p.status == 6 { // StatusDead
 			color = "gray"
 		}
-		out[p.y][p.x] = "[" + color + "]@[-]"
+		out[p.y][p.x] = "[" + color + "]" + string(ch) + "[-]"
 	}
 
 	var b strings.Builder
@@ -530,7 +544,7 @@ func (u *UI) renderMessages(msgs []chatMessage) {
 func (u *UI) renderHelp(s *snapshot) {
 	switch {
 	case s.inGame:
-		u.help.SetText("[white]WASD/Arrows[-] Move  [white]J/Space[-] Attack  [white]1-5[-] Item  [white]T[-] Chat  [white]Q[-] Leave")
+		u.help.SetText("[green]@[-]you [white]A-Z[-]others [yellow]+[-]hp [yellow]^[-]atk [yellow]*[-]shield | WASD Move  J/Space Attack  1-5 Item  T Chat  Q Leave")
 	case s.inRoom:
 		u.help.SetText("[white]R[-] Ready  [white]T[-] Chat  [white]L[-] Leave  [white]Q/ESC[-] Quit")
 	default:
@@ -583,10 +597,23 @@ func inBounds(x, y int) bool {
 	return x >= 0 && x < config.MapWidth && y >= 0 && y < config.MapHeight
 }
 
-// mapIsInPoison mirrors the server's Chebyshev-distance poison check.
+func manhattan(x1, y1, x2, y2 int) int {
+	dx, dy := x1-x2, y1-y2
+	if dx < 0 {
+		dx = -dx
+	}
+	if dy < 0 {
+		dy = -dy
+	}
+	return dx + dy
+}
+
+// mapIsInPoison mirrors the server's symmetric poison check (see the server's
+// gamemap.go): doubled coordinates keep the safe zone centered on the true
+// (fractional) map center so both edges close at the same rate.
 func mapIsInPoison(x, y, radius int) bool {
-	cx, cy := config.MapWidth/2, config.MapHeight/2
-	dx, dy := x-cx, y-cy
+	dx := x*2 - (config.MapWidth - 1)
+	dy := y*2 - (config.MapHeight - 1)
 	if dx < 0 {
 		dx = -dx
 	}
@@ -597,5 +624,5 @@ func mapIsInPoison(x, y, radius int) bool {
 	if dy > dx {
 		dist = dy
 	}
-	return dist > radius
+	return dist > radius*2
 }

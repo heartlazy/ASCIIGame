@@ -337,7 +337,10 @@ func (s *Server) handleChat(p *Player, msg protocol.Message) {
 		s.sendErr(p, config.ErrRoomNotFound, "Room not found")
 		return
 	}
-	room.broadcast(protocol.BuildChatMsg(p.getUsername(), message))
+	// Include the sender's player id so recipients can tell players apart
+	// (the client renders CHAT_MSG as "[sender] message").
+	sender := fmt.Sprintf("%s#%d", p.getUsername(), p.id)
+	room.broadcast(protocol.BuildChatMsg(sender, message))
 }
 
 // handleLogout mirrors handler_logout (handler.c:500-521).
