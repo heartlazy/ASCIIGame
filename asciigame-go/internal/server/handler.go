@@ -57,8 +57,8 @@ func (s *Server) handle(p *Player, msg protocol.Message) {
 	}
 }
 
-// handleLogin mirrors handler_login (handler.c:72-177). Recovery reconnection
-// is added in phase 3.
+// handleLogin mirrors handler_login (handler.c:72-177), including recovery
+// reconnection (rejoining an in-progress game after a crash).
 func (s *Server) handleLogin(p *Player, msg protocol.Message) {
 	if len(msg.Args) < 2 {
 		s.sendErr(p, config.ErrInvalidArgCount, "Usage: LOGIN|username|password")

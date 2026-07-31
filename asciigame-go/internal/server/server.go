@@ -190,7 +190,6 @@ func (s *Server) disconnect(p *Player) {
 		}
 	}
 	s.unregisterPlayer(p)
-	p.closeOnce()
-	_ = p.conn.Close()
+	p.shutdown()
 	log.Printf("player %s disconnected", p.label())
 }

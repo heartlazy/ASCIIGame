@@ -322,8 +322,8 @@ func (r *Room) applyPoisonDamage() {
 	}
 }
 
-// checkEnd mirrors game_check_end (game.c:543-618) for the MVP (recovery-room
-// handling is added in phase 3):
+// checkEnd mirrors game_check_end (game.c:543-618), including recovery-room
+// wait handling:
 //
 //	>=0 winner id, -1 draw/timeout, -2 continue.
 func (r *Room) checkEnd() int {
@@ -495,6 +495,7 @@ func (r *Room) endGame(winnerID int) {
 			continue
 		}
 		p.mu.Lock()
+		username := p.username
 		p.status = StatusInRoom
 		p.hp = p.maxHP
 		p.x = 0
@@ -505,6 +506,12 @@ func (r *Room) endGame(winnerID int) {
 		p.atkBuffWarned = false
 		p.inventoryCount = 0
 		p.mu.Unlock()
+
+		// Record win/loss stats (storage_update_stats). winnerID == -1 is a
+		// draw/timeout, so everyone takes a loss.
+		if username != "" {
+			r.srv.store.updateStats(username, id == winnerID)
+		}
 	}
 
 	r.mu.Lock()

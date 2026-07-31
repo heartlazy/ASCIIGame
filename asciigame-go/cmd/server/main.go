@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"syscall"
 
@@ -16,6 +17,12 @@ import (
 )
 
 func main() {
+	// Raise the GC threshold to smooth the 50ms game-tick cadence (fewer, less
+	// frequent collections). Skipped if the operator set GOGC explicitly.
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(200)
+	}
+
 	port := config.ServerPort
 	if len(os.Args) > 1 {
 		p, err := strconv.Atoi(os.Args[1])

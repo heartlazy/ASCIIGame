@@ -81,17 +81,26 @@ func newPlayer(conn net.Conn, id int) *Player {
 }
 
 // Send enqueues a raw frame (already terminated with '\n') for delivery. Safe
-// for concurrent use; drops silently once the player is closed.
+// for concurrent use. If the outbound buffer is full the client is not reading
+// fast enough (or is dead); rather than block the caller — which is often the
+// shared per-room game loop — we kick the connection. The read goroutine then
+// unblocks and runs the normal disconnect cleanup.
 func (p *Player) Send(msg string) {
 	select {
 	case p.out <- msg:
 	case <-p.done:
+	default:
+		p.shutdown()
 	}
 }
 
-// closeOnce signals the writer goroutine to stop. Idempotent.
-func (p *Player) closeOnce() {
-	p.once.Do(func() { close(p.done) })
+// shutdown stops the writer goroutine and closes the socket, exactly once.
+// Closing the conn unblocks the connection's read goroutine so it can clean up.
+func (p *Player) shutdown() {
+	p.once.Do(func() {
+		close(p.done)
+		_ = p.conn.Close()
+	})
 }
 
 // resetGameState mirrors player_reset_game_state (player.c:208-234).

@@ -63,9 +63,6 @@ func mapIsWalkable(m *gameMap, x, y int) bool {
 	return m[y][x] != cellWall
 }
 
-// mapCenter mirrors map_get_center (map.c:87-94).
-func mapCenter() (int, int) { return config.MapWidth / 2, config.MapHeight / 2 }
-
 // mapIsInPoison reports whether (x,y) is outside the safe zone (i.e. in the
 // poison). It uses doubled coordinates so the safe zone is symmetric about the
 // true center — for even dimensions the geometric center falls between cells
