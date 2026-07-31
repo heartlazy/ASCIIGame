@@ -225,8 +225,12 @@ func (s *State) handleOK(msg protocol.Message) {
 	if strings.Contains(m, "Left room") {
 		s.inRoom = false
 		s.isReady = false
+		s.inGame = false // leaving mid-game must return to the lobby view
 		s.roomID = -1
 		s.roomName = ""
+		s.players = nil
+		s.items = nil
+		s.attackActive = false
 	}
 	switch m {
 	case "Ready":

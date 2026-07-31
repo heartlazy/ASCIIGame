@@ -262,7 +262,10 @@ func (u *UI) onKey(ev *tcell.EventKey) *tcell.EventKey {
 	r := ev.Rune()
 	debugf("onKey rune=%q key=%v inGame=%v inRoom=%v", r, ev.Key(), inGame, inRoom)
 	if r == 'q' || r == 'Q' {
-		if !inGame {
+		// Quit if not in game, OR if the connection is dead (LEAVE_ROOM would
+		// go nowhere, so Q must be an escape hatch — matches the "Press Q to
+		// quit" message shown on disconnect).
+		if !inGame || !u.connected.Load() {
 			u.app.Stop()
 			return nil
 		}
