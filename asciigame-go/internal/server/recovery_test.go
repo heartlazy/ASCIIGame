@@ -42,7 +42,7 @@ func serveOn(t *testing.T, srv *Server) string {
 // into the recovered, in-progress room with restored state.
 func TestCrashRecovery(t *testing.T) {
 	chdirTemp(t)
-	usersPath := filepath.FromSlash("data/users.json")
+	usersPath := filepath.FromSlash("data/game.db")
 
 	// 1. Register alice & bob on a first server instance, then stop it.
 	s1, err := New(usersPath)
@@ -58,6 +58,7 @@ func TestCrashRecovery(t *testing.T) {
 		}
 		c.close()
 	}
+	s1.Close() // release the DB handle before the "restart" reopens it
 
 	// 2. Simulate a crash mid-game by writing a WAL with no GAME_END.
 	if err := os.MkdirAll(filepath.FromSlash("data/wal"), 0o755); err != nil {
@@ -80,6 +81,7 @@ func TestCrashRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New s2: %v", err)
 	}
+	t.Cleanup(func() { s2.Close() })
 	s2.RecoverAll()
 	if _, ok := s2.checkRecovery("alice"); !ok {
 		t.Fatalf("alice not marked recoverable after RecoverAll")

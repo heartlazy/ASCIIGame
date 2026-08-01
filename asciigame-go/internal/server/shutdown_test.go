@@ -14,11 +14,12 @@ import (
 // can be recovered on restart.
 func TestGracefulShutdown(t *testing.T) {
 	chdirTemp(t)
-	usersPath := filepath.FromSlash("data/users.json")
+	usersPath := filepath.FromSlash("data/game.db")
 	srv, err := New(usersPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { srv.Close() })
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

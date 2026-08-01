@@ -3,44 +3,106 @@ package server
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"golang.org/x/crypto/bcrypt"
+	_ "modernc.org/sqlite" // pure-Go SQLite driver (no cgo)
 
 	"github.com/heartlazyli/asciigame/internal/config"
 )
 
-// userRecord mirrors the C UserRecord (storage.h). The C version stored fixed
-// 128-byte binary records in data/users.dat; the Go port uses JSON (per the
-// port plan) since the store is internal and not exercised by the wire tests.
+// userRecord is one account row. Earlier builds stored these as JSON; accounts
+// now live in SQLite (see newStorage) so per-account updates are atomic and
+// loading is O(1) instead of rewriting the whole file each change.
 type userRecord struct {
-	Username string `json:"username"`
-	// PasswordHash is a bcrypt hash ("$2..."). Records written by older builds
-	// hold a bare SHA-256 hex digest and are upgraded to bcrypt on next login.
-	PasswordHash string `json:"password_hash"`
-	Wins         int    `json:"wins"`
-	Losses       int    `json:"losses"`
-	Points       int    `json:"points"`
+	Username string
+	// PasswordHash is a bcrypt hash ("$2..."). Records imported from the old
+	// JSON store (or the C server) may hold a bare SHA-256 hex digest and are
+	// upgraded to bcrypt on the next successful login.
+	PasswordHash string
+	Wins         int
+	Losses       int
+	Points       int
 }
 
-// storage is the user account store, mirroring storage.c behavior.
+// storage is the SQLite-backed user account store. *sql.DB is safe for
+// concurrent use; SQLite serializes writes internally, which is ample for the
+// low account-write rate (register / login upgrade / end-of-match stats).
 type storage struct {
-	mu    sync.Mutex
-	path  string
-	users map[string]*userRecord
+	db *sql.DB
 }
 
+// newStorage opens (creating if needed) the SQLite database at path, ensures
+// the schema exists, and performs a one-time import from a sibling users.json
+// left by older builds.
 func newStorage(path string) (*storage, error) {
-	s := &storage{path: path, users: make(map[string]*userRecord)}
-	if err := s.load(); err != nil {
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	// busy_timeout lets concurrent writers wait for the lock instead of failing.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
 		return nil, err
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS users (
+		username      TEXT PRIMARY KEY,
+		password_hash TEXT NOT NULL,
+		wins          INTEGER NOT NULL DEFAULT 0,
+		losses        INTEGER NOT NULL DEFAULT 0,
+		points        INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	s := &storage{db: db}
+	s.migrateFromJSON(path)
 	return s, nil
+}
+
+// close releases the database handle.
+func (s *storage) close() error { return s.db.Close() }
+
+// migrateFromJSON imports accounts from a legacy users.json sitting next to the
+// database, once, when the users table is still empty. The JSON file is then
+// renamed so the import never repeats.
+func (s *storage) migrateFromJSON(dbPath string) {
+	jsonPath := filepath.Join(filepath.Dir(dbPath), "users.json")
+	if jsonPath == dbPath {
+		return // the DB file itself is not a migration source
+	}
+	data, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return // no legacy file: nothing to migrate
+	}
+	var list []*userRecord
+	if json.Unmarshal(data, &list) != nil {
+		return
+	}
+	var n int
+	if s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); n > 0 {
+		return // already populated
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return
+	}
+	for _, u := range list {
+		_, _ = tx.Exec(`INSERT OR IGNORE INTO users(username,password_hash,wins,losses,points)
+			VALUES(?,?,?,?,?)`, u.Username, u.PasswordHash, u.Wins, u.Losses, u.Points)
+	}
+	if tx.Commit() == nil {
+		_ = os.Rename(jsonPath, jsonPath+".migrated")
+		log.Printf("storage: migrated %d users from %s to SQLite", len(list), jsonPath)
+	}
 }
 
 // hashPassword returns a bcrypt hash of the password.
@@ -79,16 +141,21 @@ func (s *storage) register(username, password string) int {
 	if username == "" || len(username) >= config.MaxUsername {
 		return -2
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.users[username]; ok {
-		return -1
-	}
-	if len(s.users) >= config.MaxUsers {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
 		return -2
 	}
-	s.users[username] = &userRecord{Username: username, PasswordHash: hashPassword(password)}
-	_ = s.saveLocked()
+	if n >= config.MaxUsers {
+		return -2
+	}
+	_, err := s.db.Exec(`INSERT INTO users(username,password_hash) VALUES(?,?)`,
+		username, hashPassword(password))
+	if err != nil {
+		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
+			return -1 // username already exists
+		}
+		return -2
+	}
 	return 0
 }
 
@@ -99,76 +166,43 @@ func (s *storage) register(username, password string) int {
 // On a successful login against a legacy SHA-256 record, the stored hash is
 // transparently upgraded to bcrypt.
 func (s *storage) verify(username, password string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u, ok := s.users[username]
-	if !ok {
+	var stored string
+	err := s.db.QueryRow(`SELECT password_hash FROM users WHERE username=?`, username).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
 		return -1
 	}
-	match, legacy := checkPassword(u.PasswordHash, password)
+	if err != nil {
+		return -2
+	}
+	match, legacy := checkPassword(stored, password)
 	if !match {
 		return -2
 	}
 	if legacy {
 		if h := hashPassword(password); h != "" {
-			u.PasswordHash = h
-			_ = s.saveLocked()
+			_, _ = s.db.Exec(`UPDATE users SET password_hash=? WHERE username=?`, h, username)
 		}
 	}
 	return 0
 }
 
-// updateStats mirrors storage_update_stats (storage.c:268-304).
+// updateStats mirrors storage_update_stats (storage.c:268-304). A single atomic
+// UPDATE — no full-file rewrite. Unknown users are a no-op (0 rows affected).
 func (s *storage) updateStats(username string, win bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u, ok := s.users[username]
-	if !ok {
-		return
-	}
 	if win {
-		u.Wins++
-		u.Points += 10
+		_, _ = s.db.Exec(`UPDATE users SET wins=wins+1, points=points+10 WHERE username=?`, username)
 	} else {
-		u.Losses++
-		u.Points++
+		_, _ = s.db.Exec(`UPDATE users SET losses=losses+1, points=points+1 WHERE username=?`, username)
 	}
-	_ = s.saveLocked()
 }
 
-func (s *storage) load() error {
-	data, err := os.ReadFile(s.path)
+// getUser returns the account row, or nil if it does not exist.
+func (s *storage) getUser(username string) *userRecord {
+	u := &userRecord{Username: username}
+	err := s.db.QueryRow(`SELECT password_hash,wins,losses,points FROM users WHERE username=?`, username).
+		Scan(&u.PasswordHash, &u.Wins, &u.Losses, &u.Points)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // absent file is normal
-		}
-		return err
+		return nil
 	}
-	var list []*userRecord
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &list); err != nil {
-			return err
-		}
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, u := range list {
-		s.users[u.Username] = u
-	}
-	return nil
-}
-
-func (s *storage) saveLocked() error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
-		return err
-	}
-	list := make([]*userRecord, 0, len(s.users))
-	for _, u := range s.users {
-		list = append(list, u)
-	}
-	data, err := json.MarshalIndent(list, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.path, data, 0o644)
+	return u
 }

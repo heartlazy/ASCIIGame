@@ -56,6 +56,10 @@ func New(storagePath string) (*Server, error) {
 	}, nil
 }
 
+// Close releases server resources (the account database). Safe to call once
+// after Serve returns.
+func (s *Server) Close() error { return s.store.close() }
+
 // ListenAndServe accepts connections on addr until ctx is cancelled.
 func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	ln, err := net.Listen("tcp", addr)

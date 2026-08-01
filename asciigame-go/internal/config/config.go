@@ -84,7 +84,9 @@ const (
 
 // Storage
 const (
-	UsersFile       = "data/users.json" // Go version uses JSON (C used data/users.dat)
+	// UsersDB is the SQLite database of accounts. A legacy data/users.json (from
+	// older builds) sitting alongside is imported once on first startup.
+	UsersDB         = "data/game.db"
 	MaxUsers        = 10240
 	PasswordHashLen = 65 // SHA256 hex + null
 )

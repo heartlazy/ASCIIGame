@@ -15,10 +15,11 @@ import (
 // startServer boots a server on an ephemeral port for the client tests.
 func startServer(t *testing.T) string {
 	t.Helper()
-	srv, err := server.New(filepath.Join(t.TempDir(), "users.json"))
+	srv, err := server.New(filepath.Join(t.TempDir(), "game.db"))
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
+	t.Cleanup(func() { srv.Close() })
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)

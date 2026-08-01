@@ -37,6 +37,10 @@ Always: `room.mu` → `player.mu`. Registry locks (`pmu`, `rmu`) are leaf locks 
 
 ## Persistence
 
+- **Accounts**: SQLite (`data/game.db`) via the pure-Go `modernc.org/sqlite`
+  driver (no cgo). Passwords are bcrypt; legacy unsalted SHA-256 records (from
+  the C server / old JSON store) still verify and upgrade to bcrypt on login. A
+  legacy `data/users.json` is imported once on first startup, then renamed.
 - **WAL**: text format `TS|SEQ|ROOM|ACTION|DATA\n` (C-compatible), fsync'd every 1s
 - **Snapshot**: JSON, every 20s, atomic write (tmp+rename)
 - **Recovery**: On startup, replays WAL for rooms without GAME_END; players rejoin on login

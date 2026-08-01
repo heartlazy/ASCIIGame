@@ -33,7 +33,7 @@ func main() {
 		port = p
 	}
 
-	srv, err := server.New(filepath.FromSlash(config.UsersFile))
+	srv, err := server.New(filepath.FromSlash(config.UsersDB))
 	if err != nil {
 		log.Fatalf("failed to init server: %v", err)
 	}

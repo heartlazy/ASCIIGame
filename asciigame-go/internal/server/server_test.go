@@ -68,10 +68,11 @@ func (c *testClient) close() { _ = c.conn.Close() }
 // startTestServer boots a Server on an ephemeral port and returns its address.
 func startTestServer(t *testing.T) string {
 	t.Helper()
-	srv, err := New(filepath.Join(t.TempDir(), "users.json"))
+	srv, err := New(filepath.Join(t.TempDir(), "game.db"))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(func() { srv.Close() })
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
