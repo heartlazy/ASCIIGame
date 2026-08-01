@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
-	"strings"
 	"sync"
 
 	"github.com/heartlazyli/asciigame/internal/config"
@@ -51,6 +50,11 @@ type Room struct {
 	lastPoisonShrink int64
 	lastSnapshotTime int64
 	running          bool
+
+	// lastStateSig is the marshaled GameState signature (timestamp excluded)
+	// from the last broadcastState; used to skip identical broadcasts. Reset on
+	// game start/end so the first state of each game always sends.
+	lastStateSig []byte
 
 	// Recovery bookkeeping (recovery.c). When a room is reconstructed after a
 	// crash it waits for the expected players to reconnect before judging the
@@ -168,7 +172,7 @@ func (r *Room) addPlayer(p *Player) int {
 	p.mu.Unlock()
 
 	log.Printf("player %s joined room %d", p.label(), r.id)
-	r.broadcast(protocol.BuildPlayerJoin(p.id, p.username))
+	r.broadcast(protocol.NewPlayerJoin(int32(p.id), p.username))
 	return 0
 }
 
@@ -198,7 +202,7 @@ func (r *Room) removePlayer(p *Player) {
 	p.mu.Unlock()
 
 	if remaining > 0 {
-		r.broadcast(protocol.BuildPlayerLeave(p.id))
+		r.broadcast(protocol.NewPlayerLeave(int32(p.id)))
 	} else {
 		r.srv.destroyRoom(r)
 	}
@@ -206,9 +210,9 @@ func (r *Room) removePlayer(p *Player) {
 
 // broadcast mirrors room_broadcast (room.c:558-585): snapshot members under the
 // room lock, then send off-lock so no socket write happens under a mutex.
-func (r *Room) broadcast(msg string) {
+func (r *Room) broadcast(f *protocol.Frame) {
 	for _, p := range r.snapshotMembers() {
-		p.Send(msg)
+		p.Send(f)
 	}
 }
 
@@ -267,6 +271,7 @@ func (r *Room) startGame() int {
 
 	ids := r.membersLocked()
 	r.status = RoomGaming
+	r.lastStateSig = nil // first broadcastState of the game always sends
 	r.mu.Unlock()
 
 	// Reset and place players (not holding room lock while touching players,
@@ -303,13 +308,13 @@ func (r *Room) startGame() int {
 	r.wal.sync()
 
 	log.Printf("game started in room %d", r.id)
-	r.broadcast(protocol.BuildGameStart())
+	r.broadcast(protocol.NewGameStart())
 	return 0
 }
 
-// getRoomList mirrors room_get_list (room.c:587-639): "id,name,count,max,status"
-// entries joined by ';', framed as ROOM_LIST.
-func (s *Server) getRoomList() string {
+// getRoomList mirrors room_get_list (room.c:587-639), returning a ROOM_LIST
+// frame carrying one RoomInfo per live room.
+func (s *Server) getRoomList() *protocol.Frame {
 	s.rmu.RLock()
 	rooms := make([]*Room, 0, len(s.rooms))
 	for _, r := range s.rooms {
@@ -317,14 +322,17 @@ func (s *Server) getRoomList() string {
 	}
 	s.rmu.RUnlock()
 
-	var entries []string
+	infos := make([]*protocol.RoomInfo, 0, len(rooms))
 	for _, r := range rooms {
 		r.mu.Lock()
-		entries = append(entries, fmt.Sprintf("%d,%s,%d,%d,%d",
-			r.id, r.name, r.playerCount, r.maxPlayers, int(r.status)))
+		infos = append(infos, &protocol.RoomInfo{
+			RoomId: int32(r.id), Name: r.name,
+			PlayerCount: int32(r.playerCount), MaxPlayers: int32(r.maxPlayers),
+			Status: int32(r.status),
+		})
 		r.mu.Unlock()
 	}
-	return protocol.BuildRoomList(strings.Join(entries, ";"))
+	return protocol.NewRoomList(infos)
 }
 
 func truncate(s string, n int) string {

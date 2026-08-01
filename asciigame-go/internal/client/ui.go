@@ -125,7 +125,7 @@ func (u *UI) doLogin(username, password string) {
 		u.showModal(fmt.Sprintf("Failed to connect: %v", err))
 		return
 	}
-	_ = u.conn.Send(protocol.BuildLogin(username, password))
+	_ = u.conn.Send(protocol.NewLogin(username, password))
 
 	// Wait briefly for the server response (the read goroutine updates state).
 	u.username = username
@@ -151,14 +151,14 @@ func (u *UI) doRegisterAndLogin(username, password string) {
 	u.state.username = username
 	u.state.mu.Unlock()
 
-	_ = u.conn.Send(protocol.BuildRegister(username, password))
+	_ = u.conn.Send(protocol.NewRegister(username, password))
 
 	// Wait for register response, then login.
 	go func() {
 		if !u.waitForResponse("Registration successful", "Register failed") {
 			return
 		}
-		_ = u.conn.Send(protocol.BuildLogin(username, password))
+		_ = u.conn.Send(protocol.NewLogin(username, password))
 		u.waitForLoginResult(username)
 	}()
 }
@@ -230,9 +230,9 @@ func (u *UI) waitForResponse(successSubstr, failMsg string) bool {
 }
 
 // onMsg runs on the read goroutine: update state, then redraw on the UI thread.
-func (u *UI) onMsg(raw string) {
-	debugf("recv %q", raw)
-	if u.state.Update(raw) {
+func (u *UI) onMsg(f *protocol.Frame) {
+	debugf("recv %s", frameName(f))
+	if u.state.Update(f) {
 		u.app.QueueUpdateDraw(u.render)
 	}
 }
@@ -285,40 +285,40 @@ func (u *UI) onKey(ev *tcell.EventKey) *tcell.EventKey {
 func (u *UI) gameKey(ev *tcell.EventKey) {
 	switch ev.Key() {
 	case tcell.KeyUp:
-		u.send(protocol.BuildMove('U'))
+		u.send(protocol.NewMove("U"))
 		return
 	case tcell.KeyDown:
-		u.send(protocol.BuildMove('D'))
+		u.send(protocol.NewMove("D"))
 		return
 	case tcell.KeyLeft:
-		u.send(protocol.BuildMove('L'))
+		u.send(protocol.NewMove("L"))
 		return
 	case tcell.KeyRight:
-		u.send(protocol.BuildMove('R'))
+		u.send(protocol.NewMove("R"))
 		return
 	case tcell.KeyEnter:
-		u.send(protocol.BuildAttack())
+		u.send(protocol.NewAttack())
 		return
 	}
 	switch ev.Rune() {
 	case 'w', 'W':
-		u.send(protocol.BuildMove('U'))
+		u.send(protocol.NewMove("U"))
 	case 's', 'S':
-		u.send(protocol.BuildMove('D'))
+		u.send(protocol.NewMove("D"))
 	case 'a', 'A':
-		u.send(protocol.BuildMove('L'))
+		u.send(protocol.NewMove("L"))
 	case 'd', 'D':
-		u.send(protocol.BuildMove('R'))
+		u.send(protocol.NewMove("R"))
 	case 'j', 'J', ' ':
-		u.send(protocol.BuildAttack())
+		u.send(protocol.NewAttack())
 	case '1', '2', '3', '4', '5':
-		u.send(protocol.BuildUseItem(int(ev.Rune() - '1')))
+		u.send(protocol.NewUseItem(int32(ev.Rune() - '1')))
 	case 'q', 'Q':
-		u.send(protocol.BuildSimple("LEAVE_ROOM"))
+		u.send(protocol.NewLeaveRoom())
 	case 't', 'T':
 		u.prompt("Chat", func(text string) {
 			if strings.TrimSpace(text) != "" {
-				u.send(protocol.BuildChat(text))
+				u.send(protocol.NewChat(text))
 			}
 		})
 	}
@@ -327,13 +327,13 @@ func (u *UI) gameKey(ev *tcell.EventKey) {
 func (u *UI) roomKey(ev *tcell.EventKey) {
 	switch ev.Rune() {
 	case 'r', 'R':
-		u.send(protocol.BuildSimple("READY"))
+		u.send(protocol.NewReady())
 	case 'l', 'L':
-		u.send(protocol.BuildSimple("LEAVE_ROOM"))
+		u.send(protocol.NewLeaveRoom())
 	case 't', 'T':
 		u.prompt("Chat", func(text string) {
 			if strings.TrimSpace(text) != "" {
-				u.send(protocol.BuildChat(text))
+				u.send(protocol.NewChat(text))
 			}
 		})
 	}
@@ -346,13 +346,13 @@ func (u *UI) lobbyKey(ev *tcell.EventKey) {
 			if strings.TrimSpace(name) == "" {
 				name = "Room"
 			}
-			u.send(protocol.BuildCreateRoom(name, 6))
+			u.send(protocol.NewCreateRoom(name, 6))
 		})
 	case 'l', 'L':
 		u.state.mu.Lock()
 		u.state.addMessage("System", "Requesting room list...")
 		u.state.mu.Unlock()
-		u.send(protocol.BuildSimple("LIST_ROOMS"))
+		u.send(protocol.NewListRooms())
 		u.render()
 	case 'j', 'J':
 		u.prompt("Room ID (number)", func(text string) {
@@ -367,16 +367,16 @@ func (u *UI) lobbyKey(ev *tcell.EventKey) {
 				u.render()
 				return
 			}
-			u.send(protocol.BuildJoinRoom(id))
+			u.send(protocol.NewJoinRoom(int32(id)))
 		})
 	}
 }
 
-func (u *UI) send(frame string) {
+func (u *UI) send(f *protocol.Frame) {
 	connected := u.conn != nil && u.connected.Load()
-	debugf("send frame=%q connected=%v", frame, connected)
+	debugf("send frame=%s connected=%v", frameName(f), connected)
 	if connected {
-		if err := u.conn.Send(frame); err != nil {
+		if err := u.conn.Send(f); err != nil {
 			debugf("send error: %v", err)
 		}
 	}

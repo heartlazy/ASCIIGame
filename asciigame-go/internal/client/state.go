@@ -170,57 +170,53 @@ func (s *State) HasMessage(substr string) bool {
 	return false
 }
 
-// Update parses one server frame and mutates state, mirroring
-// game_update_from_server (client/game.c:603-653). It returns true if the UI
+// Update applies one server frame and mutates state, mirroring
+// game_update_from_server (client/game.c:603-653). Returns true if the UI
 // should redraw.
-func (s *State) Update(raw string) bool {
-	msg, err := protocol.Parse(raw)
-	if err != nil {
-		return false
-	}
+func (s *State) Update(f *protocol.Frame) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	switch msg.Type {
-	case protocol.CmdOK:
-		s.handleOK(msg)
-	case protocol.CmdErr:
-		s.handleErr(msg)
-	case protocol.CmdRoomList:
-		s.handleRoomList(msg)
-	case protocol.CmdRoomInfo:
-		s.handleRoomInfo(msg)
-	case protocol.CmdPlayerJoin:
-		if len(msg.Args) >= 2 {
-			s.addMessage("System", msg.Args[1]+" joined the room")
+	switch m := f.Payload.(type) {
+	case *protocol.Frame_Ok:
+		s.handleOK(m.Ok)
+	case *protocol.Frame_Error:
+		s.handleErr(m.Error)
+	case *protocol.Frame_RoomList:
+		s.handleRoomList(m.RoomList)
+	case *protocol.Frame_RoomInfo:
+		s.handleRoomInfo(m.RoomInfo)
+	case *protocol.Frame_PlayerJoin:
+		if m.PlayerJoin != nil {
+			s.addMessage("System", m.PlayerJoin.Username+" joined the room")
 		}
-	case protocol.CmdPlayerLeave:
-		if len(msg.Args) >= 1 {
-			s.addMessage("System", "Player "+msg.Args[0]+" left the room")
+	case *protocol.Frame_PlayerLeave:
+		if m.PlayerLeave != nil {
+			s.addMessage("System", "Player "+strconv.Itoa(int(m.PlayerLeave.PlayerId))+" left the room")
 		}
-	case protocol.CmdGameStart:
+	case *protocol.Frame_GameStart:
 		s.handleGameStart()
-	case protocol.CmdGameState:
-		s.handleGameState(msg)
-	case protocol.CmdGameEvent:
-		s.handleGameEvent(msg)
-	case protocol.CmdGameEnd:
-		s.handleGameEnd(msg)
-	case protocol.CmdChatMsg:
-		if len(msg.Args) >= 2 {
-			s.addMessage(msg.Args[0], msg.Args[1])
+	case *protocol.Frame_GameState:
+		s.handleGameState(m.GameState)
+	case *protocol.Frame_GameEvent:
+		s.handleGameEvent(m.GameEvent)
+	case *protocol.Frame_GameEnd:
+		s.handleGameEnd(m.GameEnd)
+	case *protocol.Frame_ChatMsg:
+		if m.ChatMsg != nil {
+			s.addMessage(m.ChatMsg.Sender, m.ChatMsg.Message)
 		}
 	}
 	return true
 }
 
-func (s *State) handleOK(msg protocol.Message) {
-	if len(msg.Args) == 0 {
+func (s *State) handleOK(o *protocol.Ok) {
+	if o == nil {
 		return
 	}
-	m := msg.Args[0]
-	if strings.Contains(m, "Login successful") && len(msg.Args) > 1 {
-		s.myID = atoi(msg.Args[1])
+	m := o.Message
+	if strings.Contains(m, "Login successful") && o.PlayerId > 0 {
+		s.myID = int(o.PlayerId)
 	}
 	if strings.Contains(m, "Left room") {
 		s.inRoom = false
@@ -241,51 +237,48 @@ func (s *State) handleOK(msg protocol.Message) {
 	s.addMessage("Server", m)
 }
 
-func (s *State) handleErr(msg protocol.Message) {
-	if len(msg.Args) < 2 {
+func (s *State) handleErr(e *protocol.Error) {
+	if e == nil {
 		return
 	}
-	e := msg.Args[1]
+	msg := e.Message
 	// Suppress spammy in-game errors, matching client/game.c:225-232.
-	switch e {
+	switch msg {
 	case "Invalid move", "Move on cooldown", "Attack on cooldown":
 		return
 	}
-	s.addMessage("Error", e)
+	s.addMessage("Error", msg)
 }
 
-func (s *State) handleRoomList(msg protocol.Message) {
-	if len(msg.Args) < 1 || msg.Args[0] == "" {
+func (s *State) handleRoomList(rl *protocol.RoomList) {
+	if rl == nil || len(rl.Rooms) == 0 {
 		s.addMessage("System", "No rooms available. Press C to create one.")
 		return
 	}
 	s.addMessage("System", "=== Room List ===")
-	for _, entry := range strings.Split(msg.Args[0], ";") {
-		f := strings.Split(entry, ",")
-		if len(f) < 5 {
-			continue
-		}
+	for _, r := range rl.Rooms {
 		status := "Other"
-		switch f[4] {
-		case "0":
+		switch r.Status {
+		case 0:
 			status = "Waiting"
-		case "2":
+		case 2:
 			status = "Gaming"
 		}
-		// Make the ID to type unambiguous (users mistook the name for the ID).
-		s.addMessage("", "  ID="+f[0]+"  name='"+f[1]+"'  ("+f[2]+"/"+f[3]+")  "+status)
+		s.addMessage("", "  ID="+strconv.Itoa(int(r.RoomId))+"  name='"+r.Name+"'  ("+
+			strconv.Itoa(int(r.PlayerCount))+"/"+strconv.Itoa(int(r.MaxPlayers))+")  "+status)
 	}
 	s.addMessage("System", "Press J and enter the ID number (not the name) to join")
 }
 
-func (s *State) handleRoomInfo(msg protocol.Message) {
-	if len(msg.Args) < 5 {
+func (s *State) handleRoomInfo(ri *protocol.RoomInfo) {
+	if ri == nil {
 		return
 	}
-	s.roomID = atoi(msg.Args[0])
-	s.roomName = msg.Args[1]
+	s.roomID = int(ri.RoomId)
+	s.roomName = ri.Name
 	s.inRoom = true
-	s.addMessage("System", "Joined room "+msg.Args[1]+" (ID: "+msg.Args[0]+", Players: "+msg.Args[2]+"/"+msg.Args[3]+")")
+	s.addMessage("System", "Joined room "+ri.Name+" (ID: "+strconv.Itoa(int(ri.RoomId))+
+		", Players: "+strconv.Itoa(int(ri.PlayerCount))+"/"+strconv.Itoa(int(ri.MaxPlayers))+")")
 }
 
 func (s *State) handleGameStart() {
@@ -296,40 +289,31 @@ func (s *State) handleGameStart() {
 	s.addMessage("System", "Game started! WASD to move, J/Space to attack!")
 }
 
-// handleGameState parses GAME_STATE, mirroring parse_player_states /
-// parse_item_states (client/game.c). Player entries are 13 comma fields.
-func (s *State) handleGameState(msg protocol.Message) {
-	if len(msg.Args) < 4 {
+// handleGameState mirrors parse_player_states / parse_item_states (client/game.c).
+func (s *State) handleGameState(gs *protocol.GameState) {
+	if gs == nil {
 		return
 	}
 	s.players = s.players[:0]
-	for _, tok := range strings.Split(msg.Args[1], ";") {
-		if tok == "" {
-			continue
-		}
-		f := strings.Split(tok, ",")
-		if len(f) < 4 {
-			continue
-		}
-		pv := playerView{id: atoi(f[0]), x: atoi(f[1]), y: atoi(f[2]), hp: atoi(f[3])}
-		if len(f) >= 7 {
-			pv.status = atoi(f[6])
-		}
+	for _, p := range gs.Players {
+		pv := playerView{id: int(p.Id), x: int(p.X), y: int(p.Y), hp: int(p.Hp), status: int(p.Status)}
 		if s.myID == 0 {
 			s.myID = pv.id
 		}
 		if pv.id == s.myID {
 			s.myX, s.myY, s.myHP = pv.x, pv.y, pv.hp
-			if len(f) >= 13 {
-				s.myATK = atoi(f[4])
-				s.myDEF = atoi(f[5])
-				s.myHasShield = f[7] == "1"
-				s.inventoryCount = 0
-				for i := 0; i < config.MaxInventory; i++ {
-					s.inventory[i] = atoi(f[8+i])
-					if s.inventory[i] > 0 {
-						s.inventoryCount++
-					}
+			s.myATK = int(p.Atk)
+			s.myDEF = int(p.Def)
+			s.myHasShield = p.HasShield
+			s.inventoryCount = 0
+			for i := 0; i < config.MaxInventory; i++ {
+				var t int32
+				if i < len(p.Inventory) {
+					t = p.Inventory[i]
+				}
+				s.inventory[i] = int(t)
+				if s.inventory[i] > 0 {
+					s.inventoryCount++
 				}
 			}
 		}
@@ -337,105 +321,93 @@ func (s *State) handleGameState(msg protocol.Message) {
 	}
 
 	s.items = s.items[:0]
-	for _, tok := range strings.Split(msg.Args[2], ";") {
-		if tok == "" {
-			continue
-		}
-		f := strings.Split(tok, ",")
-		if len(f) < 3 {
-			continue
-		}
-		s.items = append(s.items, itemView{x: atoi(f[0]), y: atoi(f[1]), typ: atoi(f[2])})
+	for _, it := range gs.Items {
+		s.items = append(s.items, itemView{x: int(it.X), y: int(it.Y), typ: int(it.Type)})
 	}
-
-	s.poisonRadius = atoi(msg.Args[3])
+	s.poisonRadius = int(gs.PoisonRadius)
 }
 
 // handleGameEvent surfaces combat/system events as messages, mirroring
 // handle_game_event (client/game.c:403-537).
-func (s *State) handleGameEvent(msg protocol.Message) {
-	if len(msg.Args) < 1 {
+func (s *State) handleGameEvent(ge *protocol.GameEvent) {
+	if ge == nil {
 		return
 	}
-	switch msg.Args[0] {
-	case "ATTACK":
-		// Highlight the attacked area: ATTACK|attacker|x|y, range = AttackRange.
-		if len(msg.Args) >= 4 {
-			s.attackActive = true
-			s.attackX = atoi(msg.Args[2])
-			s.attackY = atoi(msg.Args[3])
-			s.attackRadius = config.AttackRange
-			s.attackExpireMS = nowMS() + attackEffectMS
-		}
-	case "ATTACK_RESULT":
-		if len(msg.Args) >= 3 && atoi(msg.Args[1]) == s.myID {
-			if atoi(msg.Args[2]) == 0 {
+	switch ev := ge.Event.(type) {
+	case *protocol.GameEvent_Attack:
+		// Highlight the attacked area for a short time.
+		s.attackActive = true
+		s.attackX = int(ev.Attack.X)
+		s.attackY = int(ev.Attack.Y)
+		s.attackRadius = config.AttackRange
+		s.attackExpireMS = nowMS() + attackEffectMS
+	case *protocol.GameEvent_AttackResult:
+		if int(ev.AttackResult.AttackerId) == s.myID {
+			if ev.AttackResult.HitCount == 0 {
 				s.addMessage("Combat", "Attack missed!")
 			} else {
-				s.addMessage("Combat", "Attack hit "+msg.Args[2]+" target(s)!")
+				s.addMessage("Combat", "Attack hit "+strconv.Itoa(int(ev.AttackResult.HitCount))+" target(s)!")
 			}
 		}
-	case "DAMAGE":
-		if len(msg.Args) >= 5 {
-			attacker, victim := atoi(msg.Args[1]), atoi(msg.Args[2])
-			if victim == s.myID {
-				s.myHP = atoi(msg.Args[4])
-				s.addMessage("Combat", "You took "+msg.Args[3]+" damage! HP: "+msg.Args[4])
-			} else if attacker == s.myID {
-				s.addMessage("Combat", "You dealt "+msg.Args[3]+" damage!")
-			}
+	case *protocol.GameEvent_Damage:
+		attacker, victim := int(ev.Damage.AttackerId), int(ev.Damage.VictimId)
+		dmg := strconv.Itoa(int(ev.Damage.Damage))
+		hp := strconv.Itoa(int(ev.Damage.Hp))
+		switch {
+		case victim == s.myID:
+			s.myHP = int(ev.Damage.Hp)
+			s.addMessage("Combat", "You took "+dmg+" damage! HP: "+hp)
+		case attacker == s.myID:
+			s.addMessage("Combat", "You dealt "+dmg+" damage!")
 		}
-	case "KILL":
-		if len(msg.Args) >= 3 {
-			killer, victim := atoi(msg.Args[1]), atoi(msg.Args[2])
-			switch {
-			case victim == s.myID:
-				s.addMessage("Combat", "You were killed by player "+msg.Args[1]+"!")
-			case killer == s.myID:
-				s.addMessage("Combat", "You killed player "+msg.Args[2]+"!")
-			}
+	case *protocol.GameEvent_Kill:
+		killer, victim := int(ev.Kill.KillerId), int(ev.Kill.VictimId)
+		switch {
+		case victim == s.myID:
+			s.addMessage("Combat", "You were killed by player "+strconv.Itoa(killer)+"!")
+		case killer == s.myID:
+			s.addMessage("Combat", "You killed player "+strconv.Itoa(victim)+"!")
 		}
-	case "SHIELD":
-		if len(msg.Args) >= 3 {
-			if atoi(msg.Args[2]) == s.myID {
-				s.addMessage("Combat", "Your shield blocked an attack!")
-			} else if atoi(msg.Args[1]) == s.myID {
-				s.addMessage("Combat", "Your attack was blocked by a shield!")
-			}
+	case *protocol.GameEvent_Shield:
+		if int(ev.Shield.DefenderId) == s.myID {
+			s.addMessage("Combat", "Your shield blocked an attack!")
+		} else if int(ev.Shield.AttackerId) == s.myID {
+			s.addMessage("Combat", "Your attack was blocked by a shield!")
 		}
-	case "POISON":
+	case *protocol.GameEvent_Poison:
 		s.addMessage("System", "Poison zone shrinking!")
-	case "PICKUP":
-		if len(msg.Args) >= 3 && atoi(msg.Args[1]) == s.myID {
-			s.addMessage("Item", "Picked up "+itemName(atoi(msg.Args[2]))+"!")
+	case *protocol.GameEvent_Pickup:
+		if int(ev.Pickup.PlayerId) == s.myID {
+			s.addMessage("Item", "Picked up "+itemName(int(ev.Pickup.ItemType))+"!")
 		}
-	case "BUFF_WARNING":
-		if len(msg.Args) >= 3 && atoi(msg.Args[1]) == s.myID {
-			s.addMessage("Buff", "Attack buff expires in "+msg.Args[2]+" seconds!")
+	case *protocol.GameEvent_BuffWarning:
+		if int(ev.BuffWarning.PlayerId) == s.myID {
+			s.addMessage("Buff", "Attack buff expires in "+strconv.Itoa(int(ev.BuffWarning.Seconds))+" seconds!")
 		}
-	case "BUFF_EXPIRED":
-		if len(msg.Args) >= 2 && atoi(msg.Args[1]) == s.myID {
+	case *protocol.GameEvent_BuffExpired:
+		if int(ev.BuffExpired.PlayerId) == s.myID {
 			s.addMessage("Buff", "Attack buff has expired!")
 		}
 	}
 }
 
-func (s *State) handleGameEnd(msg protocol.Message) {
+func (s *State) handleGameEnd(g *protocol.GameEnd) {
 	s.inGame = false
 	s.isReady = false
 	s.myHP = s.myMaxHP
 	s.players = nil
 	s.poisonRadius = 25
-	if len(msg.Args) > 0 {
-		winner := atoi(msg.Args[0])
-		switch {
-		case winner == s.myID:
-			s.addMessage("System", "You win!")
-		case winner < 0:
-			s.addMessage("System", "Game ended - Draw!")
-		default:
-			s.addMessage("System", "Game ended - Player "+msg.Args[0]+" wins!")
-		}
+	if g == nil {
+		return
+	}
+	winner := int(g.WinnerId)
+	switch {
+	case winner == s.myID:
+		s.addMessage("System", "You win!")
+	case winner < 0:
+		s.addMessage("System", "Game ended - Draw!")
+	default:
+		s.addMessage("System", "Game ended - Player "+strconv.Itoa(winner)+" wins!")
 	}
 }
 
@@ -450,12 +422,4 @@ func itemName(t int) string {
 	default:
 		return "Item"
 	}
-}
-
-func atoi(s string) int {
-	n, err := strconv.Atoi(strings.TrimSpace(s))
-	if err != nil {
-		return 0
-	}
-	return n
 }

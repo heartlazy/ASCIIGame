@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package asciigame;
+
+option go_package = "github.com/heartlazyli/asciigame/internal/protocol;protocol";
+
+// Frame is the top-level network message. On the wire each Frame is
+// length-prefixed: a 4-byte big-endian uint32 length followed by that many
+// bytes of the marshaled Frame. The payload oneof discriminates the message.
+message Frame {
+  oneof payload {
+    // client -> server
+    Login login = 1;
+    Register register = 2;
+    ListRooms list_rooms = 3;
+    CreateRoom create_room = 4;
+    JoinRoom join_room = 5;
+    LeaveRoom leave_room = 6;
+    Ready ready = 7;
+    Move move = 8;
+    Attack attack = 9;
+    UseItem use_item = 10;
+    Chat chat = 11;
+    Logout logout = 12;
+    // server -> client
+    Ok ok = 13;
+    Error error = 14;
+    RoomList room_list = 15;
+    RoomInfo room_info = 16;
+    PlayerJoin player_join = 17;
+    PlayerLeave player_leave = 18;
+    GameStart game_start = 19;
+    MapData map_data = 20;
+    GameState game_state = 21;
+    GameEvent game_event = 22;
+    GameEnd game_end = 23;
+    ChatMsg chat_msg = 24;
+    Kick kick = 25;
+  }
+}
+
+// ---- client -> server ----
+
+message Login { string username = 1; string password = 2; }
+message Register { string username = 1; string password = 2; }
+message ListRooms {}
+message CreateRoom { string name = 1; int32 max_players = 2; }
+message JoinRoom { int32 room_id = 1; }
+message LeaveRoom {}
+message Ready {}
+message Move { string direction = 1; } // "U","D","L","R"
+message Attack {}
+message UseItem { int32 index = 1; }
+message Chat { string message = 1; }
+message Logout {}
+
+// ---- server -> client ----
+
+// Ok acknowledges a command. For a successful login, message is
+// "Login successful" and player_id carries the assigned id (>0).
+message Ok { string message = 1; int32 player_id = 2; }
+message Error { int32 code = 1; string message = 2; }
+
+message RoomList { repeated RoomInfo rooms = 1; }
+message RoomInfo {
+  int32 room_id = 1;
+  string name = 2;
+  int32 player_count = 3;
+  int32 max_players = 4;
+  int32 status = 5; // 0=Waiting 1=Starting 2=Gaming 3=Ended
+}
+message PlayerJoin { int32 player_id = 1; string username = 2; }
+message PlayerLeave { int32 player_id = 1; }
+message GameStart {}
+message MapData { repeated string rows = 1; }
+
+message GameState {
+  int64 timestamp = 1;
+  repeated PlayerState players = 2;
+  repeated ItemState items = 3;
+  int32 poison_radius = 4;
+}
+message PlayerState {
+  int32 id = 1;
+  int32 x = 2;
+  int32 y = 3;
+  int32 hp = 4;
+  int32 atk = 5;
+  int32 def = 6;
+  int32 status = 7; // mirrors server PlayerStatus enum
+  bool has_shield = 8;
+  repeated int32 inventory = 9; // up to 5 slots; 0 = empty
+}
+message ItemState { int32 x = 1; int32 y = 2; int32 type = 3; }
+
+// GameEvent is a discrete combat/system event, separate from the periodic
+// GameState broadcast. Its event oneof discriminates the kind.
+message GameEvent {
+  oneof event {
+    AttackEvent attack = 1;
+    DamageEvent damage = 2;
+    KillEvent kill = 3;
+    ShieldEvent shield = 4;
+    AttackResultEvent attack_result = 5;
+    PickupEvent pickup = 6;
+    PoisonEvent poison = 7;
+    BuffWarningEvent buff_warning = 8;
+    BuffExpiredEvent buff_expired = 9;
+  }
+}
+message AttackEvent { int32 attacker_id = 1; int32 x = 2; int32 y = 3; }
+message DamageEvent { int32 attacker_id = 1; int32 victim_id = 2; int32 damage = 3; int32 hp = 4; }
+message KillEvent { int32 killer_id = 1; int32 victim_id = 2; }
+message ShieldEvent { int32 attacker_id = 1; int32 defender_id = 2; }
+message AttackResultEvent { int32 attacker_id = 1; int32 hit_count = 2; }
+message PickupEvent { int32 player_id = 1; int32 item_type = 2; }
+message PoisonEvent {}
+message BuffWarningEvent { int32 player_id = 1; int32 seconds = 2; }
+message BuffExpiredEvent { int32 player_id = 1; }
+
+message GameEnd { int32 winner_id = 1; string stats = 2; } // winner_id == -1 draw
+message ChatMsg { string sender = 1; string message = 2; }
+message Kick { string reason = 1; }

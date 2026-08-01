@@ -16,7 +16,7 @@ func TestLeaveMidGameResetsView(t *testing.T) {
 	s.roomID = 5
 	s.players = []playerView{{id: 1, x: 3, y: 3, hp: 100}}
 
-	s.Update(protocol.BuildOK("Left room"))
+	s.Update(protocol.NewOk("Left room", 0))
 
 	if s.InGame() {
 		t.Error("inGame should be false after leaving")

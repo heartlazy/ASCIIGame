@@ -125,7 +125,7 @@ func (s *Server) shutdown() {
 	}
 	s.pmu.RUnlock()
 	for _, p := range players {
-		p.Send(protocol.BuildKick("Server shutting down"))
+		p.Send(protocol.NewKick("Server shutting down"))
 	}
 
 	// Give the writer goroutines a brief moment to flush the KICK frame before
@@ -179,7 +179,7 @@ func (s *Server) findPlayerByUsername(username string) *Player {
 }
 
 // handleConn runs one connection: a writer goroutine drains the player's out
-// channel, and this goroutine reads newline-framed messages and dispatches
+// channel, and this goroutine reads length-prefixed frames and dispatches
 // them. Mirrors handle_client_data + handle_disconnect (main.c).
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	p := s.registerPlayer(conn)
@@ -189,21 +189,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	defer s.disconnect(p)
 
-	// bufio.Reader (not Scanner) so large frames like MAP_DATA are never capped
-	// at the 64KB Scanner token limit.
 	r := bufio.NewReader(conn)
 	for {
-		line, err := r.ReadString('\n')
+		f, err := protocol.ReadFrame(r)
 		if err != nil {
-			return
+			return // EOF / read error: disconnect
 		}
-		msg, perr := protocol.Parse(line)
-		if perr != nil {
-			// Malformed frame: mirror main.c's ERR_INVALID_FORMAT reply.
-			p.Send(protocol.BuildErr(1001, "Invalid message format"))
-			continue
-		}
-		s.handle(p, msg)
+		s.handle(p, f)
 	}
 }
 
@@ -211,8 +203,8 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 func (p *Player) writeLoop() {
 	for {
 		select {
-		case msg := <-p.out:
-			if _, err := p.conn.Write([]byte(msg)); err != nil {
+		case f := <-p.out:
+			if err := protocol.WriteFrame(p.conn, f); err != nil {
 				return
 			}
 		case <-p.done:

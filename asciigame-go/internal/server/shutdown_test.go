@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/heartlazyli/asciigame/internal/protocol"
 )
 
 // TestGracefulShutdown verifies that cancelling the serve context during a game
@@ -31,8 +33,8 @@ func TestGracefulShutdown(t *testing.T) {
 
 	reg := func(name string) {
 		c := dial(t, addr)
-		c.send("REGISTER|" + name + "|pw")
-		c.readLine()
+		c.send(protocol.NewRegister(name, "pw"))
+		c.recv()
 		c.close()
 	}
 	reg("alice")
@@ -42,27 +44,28 @@ func TestGracefulShutdown(t *testing.T) {
 	defer a.close()
 	b := dial(t, addr)
 	defer b.close()
-	a.send("LOGIN|alice|pw")
-	a.waitFor("OK")
-	b.send("LOGIN|bob|pw")
-	b.waitFor("OK")
-	a.send("CREATE_ROOM|Arena|2")
-	info := a.waitFor("ROOM_INFO")
-	roomID := strings.Split(info, "|")[1]
-	b.send("JOIN_ROOM|" + roomID)
-	b.waitFor("ROOM_INFO")
-	a.send("READY")
-	b.send("READY")
-	a.waitFor("GAME_START")
-	b.waitFor("GAME_START")
-	a.waitFor("GAME_STATE") // game is running; WAL exists
+	a.send(protocol.NewLogin("alice", "pw"))
+	a.waitFor("OK", func(f *protocol.Frame) bool { return f.GetOk() != nil })
+	b.send(protocol.NewLogin("bob", "pw"))
+	b.waitFor("OK", func(f *protocol.Frame) bool { return f.GetOk() != nil })
+	a.send(protocol.NewCreateRoom("Arena", 2))
+	info := a.waitFor("ROOM_INFO", func(f *protocol.Frame) bool { return f.GetRoomInfo() != nil }).GetRoomInfo()
+	roomID := info.RoomId
+	b.send(protocol.NewJoinRoom(roomID))
+	b.waitFor("ROOM_INFO", func(f *protocol.Frame) bool { return f.GetRoomInfo() != nil })
+	a.send(protocol.NewReady())
+	b.send(protocol.NewReady())
+	a.waitFor("GAME_START", func(f *protocol.Frame) bool { return f.GetGameStart() != nil })
+	b.waitFor("GAME_START", func(f *protocol.Frame) bool { return f.GetGameStart() != nil })
+	a.waitFor("GAME_STATE", func(f *protocol.Frame) bool { return f.GetGameState() != nil })
 
 	// Trigger graceful shutdown.
 	cancel()
 
 	// Alice should receive a KICK frame.
-	if got := a.waitFor("KICK"); !strings.Contains(got, "shutting down") {
-		t.Fatalf("expected KICK on shutdown, got %q", got)
+	kick := a.waitFor("KICK", func(f *protocol.Frame) bool { return f.GetKick() != nil }).GetKick()
+	if !strings.Contains(kick.Reason, "shutting down") {
+		t.Fatalf("expected KICK on shutdown, got %q", kick.Reason)
 	}
 
 	select {
@@ -73,7 +76,7 @@ func TestGracefulShutdown(t *testing.T) {
 
 	// The WAL for the (recovery) room must still exist without a GAME_END, so
 	// the in-progress game is recoverable on restart.
-	rid := atoi(roomID)
+	rid := int(roomID)
 	if !walExistsForRoom(rid) {
 		t.Fatalf("WAL for room %d should survive graceful shutdown", rid)
 	}

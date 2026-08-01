@@ -13,6 +13,16 @@ import (
 	"github.com/heartlazyli/asciigame/internal/protocol"
 )
 
+// atoi parses a base-10 int, returning 0 on error (mirrors C atoi). Used when
+// parsing WAL record fields.
+func atoi(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // recoveredPlayer is a player's persisted state, reconstructed from the WAL.
 type recoveredPlayer struct {
 	id                                   int
@@ -518,10 +528,10 @@ func padInv(inv []ItemType) [config.MaxInventory]int {
 // sendRecoveryRejoin sends the reconnect handshake, mirroring handler_login's
 // recovery branch (handler.c:120-149).
 func (s *Server) sendRecoveryRejoin(p *Player, room *Room) {
-	p.Send(protocol.BuildOK(fmt.Sprintf("Login successful - Rejoining game|%d", p.id)))
-	p.Send(protocol.BuildGameStart())
+	p.Send(protocol.NewOk("Login successful - Rejoining game", int32(p.id)))
+	p.Send(protocol.NewGameStart())
 	room.mu.Lock()
-	info := protocol.BuildRoomInfo(room.id, room.name, room.playerCount, room.maxPlayers, int(room.status))
+	info := protocol.NewRoomInfo(int32(room.id), room.name, int32(room.playerCount), int32(room.maxPlayers), int32(room.status))
 	room.mu.Unlock()
 	p.Send(info)
 }

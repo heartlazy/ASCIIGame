@@ -43,7 +43,7 @@ func newPeer(t *testing.T, addr string) *clientPeer {
 		t.Fatalf("dial: %v", err)
 	}
 	st := client.NewState()
-	go c.ReadLoop(func(raw string) { st.Update(raw) }, func() {})
+	go c.ReadLoop(func(f *protocol.Frame) { st.Update(f) }, func() {})
 	return &clientPeer{conn: c, state: st}
 }
 
@@ -56,25 +56,25 @@ func TestClientFullMatch(t *testing.T) {
 	b := newPeer(t, addr)
 
 	// Register + login both (register is idempotent enough here: fresh store).
-	_ = a.conn.Send(protocol.BuildRegister("alice", "pw"))
-	_ = a.conn.Send(protocol.BuildLogin("alice", "pw"))
-	_ = b.conn.Send(protocol.BuildRegister("bob", "pw"))
-	_ = b.conn.Send(protocol.BuildLogin("bob", "pw"))
+	_ = a.conn.Send(protocol.NewRegister("alice", "pw"))
+	_ = a.conn.Send(protocol.NewLogin("alice", "pw"))
+	_ = b.conn.Send(protocol.NewRegister("bob", "pw"))
+	_ = b.conn.Send(protocol.NewLogin("bob", "pw"))
 
 	// alice creates a room; wait for the client to learn the room id.
-	_ = a.conn.Send(protocol.BuildCreateRoom("Arena", 2))
+	_ = a.conn.Send(protocol.NewCreateRoom("Arena", 2))
 	if !waitUntil(func() bool { return a.state.RoomID() > 0 }) {
 		t.Fatalf("alice never entered a room")
 	}
 	roomID := a.state.RoomID()
 
-	_ = b.conn.Send(protocol.BuildJoinRoom(roomID))
+	_ = b.conn.Send(protocol.NewJoinRoom(int32(roomID)))
 	if !waitUntil(func() bool { return b.state.RoomID() == roomID }) {
 		t.Fatalf("bob never joined room %d", roomID)
 	}
 
-	_ = a.conn.Send(protocol.BuildSimple("READY"))
-	_ = b.conn.Send(protocol.BuildSimple("READY"))
+	_ = a.conn.Send(protocol.NewReady())
+	_ = b.conn.Send(protocol.NewReady())
 
 	// Both clients should observe the game start and receive player states.
 	if !waitUntil(func() bool { return a.state.InGame() && a.state.PlayerCount() >= 2 }) {
@@ -88,7 +88,7 @@ func TestClientFullMatch(t *testing.T) {
 	// A move from alice should be reflected in her mirrored position over time
 	// (server broadcasts GAME_STATE ~20/s). Just assert no panic and that state
 	// stays consistent: player count should remain >= 2 shortly after.
-	_ = a.conn.Send(protocol.BuildMove('U'))
+	_ = a.conn.Send(protocol.NewMove("U"))
 	time.Sleep(150 * time.Millisecond)
 	if a.state.PlayerCount() < 2 {
 		t.Fatalf("player count dropped unexpectedly: %d", a.state.PlayerCount())
@@ -114,30 +114,30 @@ func TestClientRoomListAndJoin(t *testing.T) {
 	a := newPeer(t, addr)
 	b := newPeer(t, addr)
 
-	_ = a.conn.Send(protocol.BuildRegister("alice", "pw"))
-	_ = a.conn.Send(protocol.BuildLogin("alice", "pw"))
-	_ = b.conn.Send(protocol.BuildRegister("bob", "pw"))
-	_ = b.conn.Send(protocol.BuildLogin("bob", "pw"))
+	_ = a.conn.Send(protocol.NewRegister("alice", "pw"))
+	_ = a.conn.Send(protocol.NewLogin("alice", "pw"))
+	_ = b.conn.Send(protocol.NewRegister("bob", "pw"))
+	_ = b.conn.Send(protocol.NewLogin("bob", "pw"))
 
 	if !waitUntil(func() bool { return a.state.MyID() > 0 }) {
 		t.Fatalf("alice never got myID")
 	}
 
 	// alice creates a room
-	_ = a.conn.Send(protocol.BuildCreateRoom("TestRoom", 6))
+	_ = a.conn.Send(protocol.NewCreateRoom("TestRoom", 6))
 	if !waitUntil(func() bool { return a.state.RoomID() > 0 }) {
 		t.Fatalf("alice never entered room")
 	}
 
 	// bob lists rooms — should see alice's room in messages
-	_ = b.conn.Send(protocol.BuildSimple("LIST_ROOMS"))
+	_ = b.conn.Send(protocol.NewListRooms())
 	if !waitUntil(func() bool { return b.state.HasMessage("TestRoom") }) {
 		t.Fatalf("bob never saw TestRoom in list")
 	}
 
 	// bob joins the room
 	roomID := a.state.RoomID()
-	_ = b.conn.Send(protocol.BuildJoinRoom(roomID))
+	_ = b.conn.Send(protocol.NewJoinRoom(int32(roomID)))
 	if !waitUntil(func() bool { return b.state.RoomID() == roomID }) {
 		t.Fatalf("bob never joined room %d, got roomID=%d", roomID, b.state.RoomID())
 	}

@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
-	"strings"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/heartlazyli/asciigame/internal/config"
 	"github.com/heartlazyli/asciigame/internal/protocol"
@@ -25,16 +27,7 @@ const (
 	dirRight = 'R'
 )
 
-// broadcastEvent mirrors game_broadcast_event (game.c:690-696).
-func (r *Room) broadcastEvent(eventType, data string) {
-	r.broadcast(protocol.BuildGameEvent(eventType, data))
-}
-
 // updateBuffs mirrors game_update_buffs (game.c:26-75).
-//
-// NOTE: the C version stripped the trailing '\n' from these events before
-// player_send (which does not re-add it), yielding an unterminated frame — a
-// latent framing bug. The Go port sends a properly terminated frame.
 func (r *Room) updateBuffs(p *Player) {
 	now := nowMS()
 	p.mu.Lock()
@@ -44,16 +37,16 @@ func (r *Room) updateBuffs(p *Player) {
 			p.atk = p.baseATK
 			p.atkBuffExpire = 0
 			p.atkBuffWarned = false
-			id := p.id
+			id := int32(p.id)
 			p.mu.Unlock()
-			r.broadcastEvent("BUFF_EXPIRED", fmt.Sprintf("%d", id))
+			r.broadcast(protocol.NewBuffExpiredEvent(id))
 			return
 		} else if remaining <= 5000 && !p.atkBuffWarned {
 			p.atkBuffWarned = true
-			seconds := int(remaining / 1000)
-			id := p.id
+			seconds := int32(remaining / 1000)
+			id := int32(p.id)
 			p.mu.Unlock()
-			r.broadcastEvent("BUFF_WARNING", fmt.Sprintf("%d|%d", id, seconds))
+			r.broadcast(protocol.NewBuffWarningEvent(id, seconds))
 			return
 		}
 	}
@@ -126,10 +119,10 @@ func (r *Room) handleAttack(p *Player) int {
 	p.mu.Unlock()
 
 	r.wal.write(walAttack, fmt.Sprintf("pid=%d,x=%d,y=%d,atk=%d", attackerID, atkX, atkY, atkPower))
-	r.broadcastEvent("ATTACK", fmt.Sprintf("%d|%d|%d", attackerID, atkX, atkY))
+	r.broadcast(protocol.NewAttackEvent(int32(attackerID), int32(atkX), int32(atkY)))
 
 	hitCount := 0
-	var events []string
+	var events []*protocol.Frame
 
 	r.mu.Lock()
 	for i := 0; i < config.MaxRoomPlayers; i++ {
@@ -143,21 +136,18 @@ func (r *Room) handleAttack(p *Player) int {
 			if target.hasShield {
 				target.hasShield = false
 				r.wal.write(walDamage, fmt.Sprintf("atk=%d,vic=%d,dmg=0,hp=%d,shield_broken=1", attackerID, target.id, target.hp))
-				events = append(events, protocol.BuildGameEvent("SHIELD",
-					fmt.Sprintf("%d|%d", attackerID, target.id)))
+				events = append(events, protocol.NewShieldEvent(int32(attackerID), int32(target.id)))
 			} else {
 				dmg := calcDamage(atkPower, target.def)
 				target.hp -= dmg
 				hitCount++
 				r.wal.write(walDamage, fmt.Sprintf("atk=%d,vic=%d,dmg=%d,hp=%d", attackerID, target.id, dmg, target.hp))
-				events = append(events, protocol.BuildGameEvent("DAMAGE",
-					fmt.Sprintf("%d|%d|%d|%d", attackerID, target.id, dmg, target.hp)))
+				events = append(events, protocol.NewDamageEvent(int32(attackerID), int32(target.id), int32(dmg), int32(target.hp)))
 				if target.hp <= 0 {
 					target.hp = 0
 					target.status = StatusDead
 					r.wal.write(walPlayerDeath, fmt.Sprintf("pid=%d,killer=%d", target.id, attackerID))
-					events = append(events, protocol.BuildGameEvent("KILL",
-						fmt.Sprintf("%d|%d", attackerID, target.id)))
+					events = append(events, protocol.NewKillEvent(int32(attackerID), int32(target.id)))
 				}
 			}
 		}
@@ -168,7 +158,7 @@ func (r *Room) handleAttack(p *Player) int {
 	for _, e := range events {
 		r.broadcast(e)
 	}
-	r.broadcastEvent("ATTACK_RESULT", fmt.Sprintf("%d|%d", attackerID, hitCount))
+	r.broadcast(protocol.NewAttackResultEvent(int32(attackerID), int32(hitCount)))
 	return 0
 }
 
@@ -199,7 +189,7 @@ func (r *Room) checkItemPickup(p *Player) {
 	}
 	r.wal.write(walPickup, fmt.Sprintf("pid=%d,item=%d,x=%d,y=%d", p.id, int(picked), px, py))
 	p.addItem(picked)
-	r.broadcastEvent("PICKUP", fmt.Sprintf("%d|%d", p.id, int(picked)))
+	r.broadcast(protocol.NewPickupEvent(int32(p.id), int32(picked)))
 }
 
 // handleUseItem mirrors game_handle_use_item (game.c:345-392):
@@ -277,7 +267,7 @@ func (r *Room) updatePoison() {
 		r.lastPoisonShrink = now
 		r.wal.write(walPoisonShrink, fmt.Sprintf("radius=%d", r.poisonRadius))
 		r.mu.Unlock()
-		r.broadcastEvent("POISON", "")
+		r.broadcast(protocol.NewPoisonEvent())
 		return
 	}
 	r.mu.Unlock()
@@ -356,50 +346,59 @@ func (r *Room) checkEnd() int {
 	return -2
 }
 
-// broadcastState mirrors game_broadcast_state (game.c:622-688). Player entry:
-// id,x,y,hp,atk,def,status,shield,inv0..inv4 (13 fields); item entry: x,y,type.
+// broadcastState mirrors game_broadcast_state (game.c:622-688), sending one
+// GameState frame per tick. Dirty detection (layer-1 optimization): if the
+// observable state (players/items/poison, excluding the ever-changing
+// timestamp) is byte-identical to the last broadcast, the frame is skipped —
+// so idle periods don't flood clients at 20 Hz. Any real change (move, damage,
+// pickup, poison shrink, join/leave) alters the signature and sends.
 func (r *Room) broadcastState() {
 	r.mu.Lock()
 	timestamp := nowMS()
 	poison := r.poisonRadius
 
-	var pb, ib strings.Builder
-	firstPlayer := true
+	players := make([]*protocol.PlayerState, 0, r.playerCount)
 	for i := 0; i < config.MaxRoomPlayers; i++ {
 		p := r.members[i]
 		if p == nil {
 			continue
 		}
 		p.mu.Lock()
-		if !firstPlayer {
-			pb.WriteByte(';')
+		inv := make([]int32, config.MaxInventory)
+		for j := 0; j < config.MaxInventory; j++ {
+			inv[j] = int32(p.inventory[j])
 		}
-		shield := 0
-		if p.hasShield {
-			shield = 1
-		}
-		fmt.Fprintf(&pb, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-			p.id, p.x, p.y, p.hp, p.atk, p.def, int(p.status), shield,
-			int(p.inventory[0]), int(p.inventory[1]), int(p.inventory[2]),
-			int(p.inventory[3]), int(p.inventory[4]))
+		players = append(players, &protocol.PlayerState{
+			Id: int32(p.id), X: int32(p.x), Y: int32(p.y), Hp: int32(p.hp),
+			Atk: int32(p.atk), Def: int32(p.def), Status: int32(p.status),
+			HasShield: p.hasShield, Inventory: inv,
+		})
 		p.mu.Unlock()
-		firstPlayer = false
 	}
 
-	firstItem := true
+	items := make([]*protocol.ItemState, 0, r.itemCount)
 	for i := 0; i < r.itemCount; i++ {
 		if !r.items[i].active {
 			continue
 		}
-		if !firstItem {
-			ib.WriteByte(';')
-		}
-		fmt.Fprintf(&ib, "%d,%d,%d", r.items[i].x, r.items[i].y, int(r.items[i].typ))
-		firstItem = false
+		items = append(items, &protocol.ItemState{
+			X: int32(r.items[i].x), Y: int32(r.items[i].y), Type: int32(r.items[i].typ),
+		})
 	}
 	r.mu.Unlock()
 
-	r.broadcast(protocol.BuildGameState(timestamp, pb.String(), ib.String(), poison))
+	// Signature excludes timestamp so an idle room produces a stable sig.
+	sig, err := proto.Marshal(&protocol.GameState{
+		Players: players, Items: items, PoisonRadius: int32(poison),
+	})
+	if err == nil {
+		if r.lastStateSig != nil && bytes.Equal(sig, r.lastStateSig) {
+			return // nothing observable changed since the last broadcast
+		}
+		r.lastStateSig = sig
+	}
+
+	r.broadcast(protocol.NewGameState(timestamp, players, items, int32(poison)))
 }
 
 // gameLoop is the per-room game goroutine, mirroring game_thread_func
@@ -455,7 +454,7 @@ func (r *Room) endGame(winnerID int) {
 	r.wal.sync()
 	r.mu.Unlock()
 
-	r.broadcast(protocol.BuildGameEnd(winnerID, ""))
+	r.broadcast(protocol.NewGameEnd(int32(winnerID), ""))
 
 	for _, p := range members {
 		p.mu.Lock()
@@ -508,5 +507,6 @@ func (r *Room) endGame(winnerID int) {
 	r.recoveryStart = 0
 	r.originalRoomID = -1
 	r.lastSnapshotTime = 0
+	r.lastStateSig = nil
 	r.mu.Unlock()
 }

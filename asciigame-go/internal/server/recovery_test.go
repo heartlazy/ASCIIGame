@@ -5,9 +5,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/heartlazyli/asciigame/internal/protocol"
 )
 
 // chdirTemp switches into a fresh temp dir (so data/wal is isolated) and
@@ -52,9 +53,9 @@ func TestCrashRecovery(t *testing.T) {
 	addr1 := serveOn(t, s1)
 	for _, name := range []string{"alice", "bob"} {
 		c := dial(t, addr1)
-		c.send("REGISTER|" + name + "|pw")
-		if got := c.readLine(); !strings.HasPrefix(got, "OK") {
-			t.Fatalf("register %s: %q", name, got)
+		c.send(protocol.NewRegister(name, "pw"))
+		if o := c.recv().GetOk(); o == nil {
+			t.Fatalf("register %s: not OK", name)
 		}
 		c.close()
 	}
@@ -91,42 +92,37 @@ func TestCrashRecovery(t *testing.T) {
 	// 4. alice logs back in -> rejoins the game directly.
 	a := dial(t, addr2)
 	defer a.close()
-	a.send("LOGIN|alice|pw")
-	if got := a.waitFor("OK"); !strings.Contains(got, "Rejoining game") {
-		t.Fatalf("alice login should rejoin: %q", got)
+	a.send(protocol.NewLogin("alice", "pw"))
+	if f := a.waitFor("OK", func(f *protocol.Frame) bool { return f.GetOk() != nil }); !isOKWith(f, "Rejoining game") {
+		t.Fatalf("alice login should rejoin: %v", f.GetOk())
 	}
-	a.waitFor("GAME_START")
-	a.waitFor("ROOM_INFO")
+	a.waitFor("GAME_START", func(f *protocol.Frame) bool { return f.GetGameStart() != nil })
+	a.waitFor("ROOM_INFO", func(f *protocol.Frame) bool { return f.GetRoomInfo() != nil })
 
 	// A GAME_STATE should show alice's restored HP of 80.
-	gs := a.waitFor("GAME_STATE")
+	gs := a.waitFor("GAME_STATE", func(f *protocol.Frame) bool { return f.GetGameState() != nil }).GetGameState()
 	if !hasPlayerWithHP(gs, 80) {
-		t.Fatalf("recovered GAME_STATE missing restored hp=80: %q", gs)
+		t.Fatalf("recovered GAME_STATE missing restored hp=80: %+v", gs)
 	}
 
 	// 5. bob logs back in -> rejoins the same recovered room.
 	b := dial(t, addr2)
 	defer b.close()
-	b.send("LOGIN|bob|pw")
-	if got := b.waitFor("OK"); !strings.Contains(got, "Rejoining game") {
-		t.Fatalf("bob login should rejoin: %q", got)
+	b.send(protocol.NewLogin("bob", "pw"))
+	if f := b.waitFor("OK", func(f *protocol.Frame) bool { return f.GetOk() != nil }); !isOKWith(f, "Rejoining game") {
+		t.Fatalf("bob login should rejoin: %v", f.GetOk())
 	}
-	b.waitFor("GAME_START")
+	b.waitFor("GAME_START", func(f *protocol.Frame) bool { return f.GetGameStart() != nil })
 }
 
-// hasPlayerWithHP reports whether a GAME_STATE frame contains a player entry
-// (13 comma fields) whose hp (field index 3) equals want.
-func hasPlayerWithHP(gameState string, want int) bool {
-	fields := strings.Split(gameState, "|")
-	if len(fields) < 3 {
+// hasPlayerWithHP reports whether a GameState contains a player with the given hp.
+func hasPlayerWithHP(gs *protocol.GameState, want int32) bool {
+	if gs == nil {
 		return false
 	}
-	for _, entry := range strings.Split(fields[2], ";") {
-		f := strings.Split(entry, ",")
-		if len(f) >= 4 {
-			if hp, err := strconv.Atoi(f[3]); err == nil && hp == want {
-				return true
-			}
+	for _, p := range gs.Players {
+		if p.Hp == want {
+			return true
 		}
 	}
 	return false

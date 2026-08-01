@@ -4,7 +4,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
+
+	"github.com/heartlazyli/asciigame/internal/protocol"
 )
 
 // debugLogger writes diagnostic lines to the file named in the ASCIIGAME_DEBUG
@@ -36,4 +40,21 @@ func debugf(format string, args ...any) {
 	if dbg != nil {
 		dbg.Output(2, fmt.Sprintf(format, args...))
 	}
+}
+
+// frameName returns the payload type name of a frame, for debug logging.
+func frameName(f *protocol.Frame) string {
+	if f == nil || f.Payload == nil {
+		return "empty"
+	}
+	return strings.TrimPrefix(fmt.Sprintf("%T", f.Payload), "*protocol.Frame_")
+}
+
+// atoi parses a base-10 int, returning 0 on error.
+func atoi(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0
+	}
+	return n
 }

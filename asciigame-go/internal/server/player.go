@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/heartlazyli/asciigame/internal/config"
+	"github.com/heartlazyli/asciigame/internal/protocol"
 )
 
 // PlayerStatus mirrors the C PlayerStatus enum (player.h:14-22).
@@ -59,7 +60,7 @@ type Player struct {
 	atkBuffExpire int64
 	atkBuffWarned bool
 
-	out  chan string
+	out  chan *protocol.Frame
 	done chan struct{}
 	once sync.Once
 }
@@ -75,19 +76,19 @@ func newPlayer(conn net.Conn, id int) *Player {
 		atk:     config.InitialATK,
 		baseATK: config.InitialATK,
 		def:     config.InitialDEF,
-		out:     make(chan string, 256),
+		out:     make(chan *protocol.Frame, 256),
 		done:    make(chan struct{}),
 	}
 }
 
-// Send enqueues a raw frame (already terminated with '\n') for delivery. Safe
-// for concurrent use. If the outbound buffer is full the client is not reading
-// fast enough (or is dead); rather than block the caller — which is often the
-// shared per-room game loop — we kick the connection. The read goroutine then
-// unblocks and runs the normal disconnect cleanup.
-func (p *Player) Send(msg string) {
+// Send enqueues a frame for delivery. Safe for concurrent use. If the outbound
+// buffer is full the client is not reading fast enough (or is dead); rather
+// than block the caller — which is often the shared per-room game loop — we
+// kick the connection. The read goroutine then unblocks and runs the normal
+// disconnect cleanup.
+func (p *Player) Send(f *protocol.Frame) {
 	select {
-	case p.out <- msg:
+	case p.out <- f:
 	case <-p.done:
 	default:
 		p.shutdown()
