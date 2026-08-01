@@ -37,13 +37,13 @@ type Room struct {
 	name       string
 	maxPlayers int
 
-	mu           sync.Mutex
-	playerIDs    [config.MaxRoomPlayers]int // -1 == empty slot
-	playerCount  int
-	status       RoomStatus
-	m            gameMap
-	items        [config.MaxMapItems]mapItem
-	itemCount    int
+	mu          sync.Mutex
+	members     [config.MaxRoomPlayers]*Player // nil == empty slot
+	playerCount int
+	status      RoomStatus
+	m           gameMap
+	items       [config.MaxMapItems]mapItem
+	itemCount   int
 	poisonRadius int
 
 	gameStartTime    int64
@@ -87,12 +87,28 @@ func (s *Server) createRoom(name string, maxPlayers int) *Room {
 		originalRoomID: -1,
 	}
 	s.nextRoomID++
-	for i := range r.playerIDs {
-		r.playerIDs[i] = -1
-	}
 	s.rooms[r.id] = r
 	log.Printf("room created: id=%d name=%s max=%d", r.id, name, maxPlayers)
 	return r
+}
+
+// snapshotMembers returns the room's live players under the room lock, so
+// callers can iterate without holding the lock or re-looking-up by id.
+func (r *Room) snapshotMembers() []*Player {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.membersLocked()
+}
+
+// membersLocked returns the live players; the caller must hold r.mu.
+func (r *Room) membersLocked() []*Player {
+	out := make([]*Player, 0, r.playerCount)
+	for _, p := range r.members {
+		if p != nil {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // findRoomByID mirrors room_find_by_id (leaf lock).
@@ -133,7 +149,7 @@ func (r *Room) addPlayer(p *Player) int {
 	}
 	slot := -1
 	for i := 0; i < config.MaxRoomPlayers; i++ {
-		if r.playerIDs[i] < 0 {
+		if r.members[i] == nil {
 			slot = i
 			break
 		}
@@ -142,7 +158,7 @@ func (r *Room) addPlayer(p *Player) int {
 		r.mu.Unlock()
 		return -1
 	}
-	r.playerIDs[slot] = p.id
+	r.members[slot] = p
 	r.playerCount++
 	r.mu.Unlock()
 
@@ -162,8 +178,8 @@ func (r *Room) removePlayer(p *Player) {
 	r.mu.Lock()
 	found := false
 	for i := 0; i < config.MaxRoomPlayers; i++ {
-		if r.playerIDs[i] == p.id {
-			r.playerIDs[i] = -1
+		if r.members[i] != nil && r.members[i].id == p.id {
+			r.members[i] = nil
 			r.playerCount--
 			found = true
 			break
@@ -188,22 +204,11 @@ func (r *Room) removePlayer(p *Player) {
 	}
 }
 
-// broadcast mirrors room_broadcast (room.c:558-585): snapshot member ids under
-// the room lock, then send off-lock so no socket write happens under a mutex.
+// broadcast mirrors room_broadcast (room.c:558-585): snapshot members under the
+// room lock, then send off-lock so no socket write happens under a mutex.
 func (r *Room) broadcast(msg string) {
-	r.mu.Lock()
-	ids := make([]int, 0, r.playerCount)
-	for i := 0; i < config.MaxRoomPlayers; i++ {
-		if r.playerIDs[i] >= 0 {
-			ids = append(ids, r.playerIDs[i])
-		}
-	}
-	r.mu.Unlock()
-
-	for _, id := range ids {
-		if p := r.srv.findPlayerByID(id); p != nil {
-			p.Send(msg)
-		}
+	for _, p := range r.snapshotMembers() {
+		p.Send(msg)
 	}
 }
 
@@ -215,19 +220,10 @@ func (r *Room) allReady() bool {
 		r.mu.Unlock()
 		return false
 	}
-	ids := make([]int, 0, r.playerCount)
-	for i := 0; i < config.MaxRoomPlayers; i++ {
-		if r.playerIDs[i] >= 0 {
-			ids = append(ids, r.playerIDs[i])
-		}
-	}
+	members := r.membersLocked()
 	r.mu.Unlock()
 
-	for _, id := range ids {
-		p := r.srv.findPlayerByID(id)
-		if p == nil {
-			continue
-		}
+	for _, p := range members {
 		p.mu.Lock()
 		ready := p.status == StatusReady
 		p.mu.Unlock()
@@ -269,22 +265,13 @@ func (r *Room) startGame() int {
 	r.lastItemSpawn = now
 	r.lastPoisonShrink = now
 
-	ids := make([]int, 0, r.playerCount)
-	for i := 0; i < config.MaxRoomPlayers; i++ {
-		if r.playerIDs[i] >= 0 {
-			ids = append(ids, r.playerIDs[i])
-		}
-	}
+	ids := r.membersLocked()
 	r.status = RoomGaming
 	r.mu.Unlock()
 
 	// Reset and place players (not holding room lock while touching players,
 	// except the brief map read under room lock, matching C).
-	for _, id := range ids {
-		p := r.srv.findPlayerByID(id)
-		if p == nil {
-			continue
-		}
+	for _, p := range ids {
 		p.resetGameState()
 		r.mu.Lock()
 		x, y := mapRandomPosition(&r.m)
@@ -298,11 +285,7 @@ func (r *Room) startGame() int {
 
 	// Persist initial game state to the WAL (room_start_game, room.c:406-442).
 	r.wal.write(walGameStart, fmt.Sprintf("room_name=%s,max_players=%d", r.name, r.maxPlayers))
-	for _, id := range ids {
-		p := r.srv.findPlayerByID(id)
-		if p == nil {
-			continue
-		}
+	for _, p := range ids {
 		p.mu.Lock()
 		rec := fmt.Sprintf("pid=%d,username=%s,x=%d,y=%d,hp=%d,max_hp=%d,atk=%d,def=%d,shield=%d,inv=%d,%d,%d,%d,%d",
 			p.id, p.username, p.x, p.y, p.hp, p.maxHP, p.atk, p.def, boolToInt(p.hasShield),

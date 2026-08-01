@@ -96,19 +96,10 @@ func (r *Room) snapshotSave() {
 			snap.Items = append(snap.Items, snapItem{X: r.items[i].x, Y: r.items[i].y, Type: r.items[i].typ})
 		}
 	}
-	ids := make([]int, 0, r.playerCount)
-	for i := 0; i < config.MaxRoomPlayers; i++ {
-		if r.playerIDs[i] >= 0 {
-			ids = append(ids, r.playerIDs[i])
-		}
-	}
+	members := r.membersLocked()
 	r.mu.Unlock()
 
-	for _, id := range ids {
-		p := r.srv.findPlayerByID(id)
-		if p == nil {
-			continue
-		}
+	for _, p := range members {
 		p.mu.Lock()
 		inv := make([]ItemType, config.MaxInventory)
 		copy(inv, p.inventory[:])

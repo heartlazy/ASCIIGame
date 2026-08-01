@@ -188,7 +188,7 @@ func (s *Server) restorePlayerToGame(p *Player, origID int) *Room {
 	room.mu.Lock()
 	slot := -1
 	for i := 0; i < config.MaxRoomPlayers; i++ {
-		if room.playerIDs[i] < 0 {
+		if room.members[i] == nil {
 			slot = i
 			break
 		}
@@ -197,7 +197,7 @@ func (s *Server) restorePlayerToGame(p *Player, origID int) *Room {
 		room.mu.Unlock()
 		return nil
 	}
-	room.playerIDs[slot] = p.id
+	room.members[slot] = p
 	room.playerCount++
 	room.mu.Unlock()
 

@@ -133,12 +133,8 @@ func (r *Room) handleAttack(p *Player) int {
 
 	r.mu.Lock()
 	for i := 0; i < config.MaxRoomPlayers; i++ {
-		id := r.playerIDs[i]
-		if id < 0 || id == attackerID {
-			continue
-		}
-		target := r.srv.findPlayerByID(id)
-		if target == nil {
+		target := r.members[i]
+		if target == nil || target.id == attackerID {
 			continue
 		}
 		target.mu.Lock()
@@ -292,23 +288,14 @@ func (r *Room) updatePoison() {
 func (r *Room) applyPoisonDamage() {
 	r.mu.Lock()
 	radius := r.poisonRadius
-	ids := make([]int, 0, r.playerCount)
-	for i := 0; i < config.MaxRoomPlayers; i++ {
-		if r.playerIDs[i] >= 0 {
-			ids = append(ids, r.playerIDs[i])
-		}
-	}
+	members := r.membersLocked()
 	r.mu.Unlock()
 
 	dmg := config.PoisonDamage * config.TickIntervalMS / 1000
 	if dmg < 1 {
 		dmg = 1
 	}
-	for _, id := range ids {
-		p := r.srv.findPlayerByID(id)
-		if p == nil {
-			continue
-		}
+	for _, p := range members {
 		p.mu.Lock()
 		if p.status == StatusGaming && p.hp > 0 && mapIsInPoison(p.x, p.y, radius) {
 			p.hp -= dmg
@@ -347,21 +334,12 @@ func (r *Room) checkEnd() int {
 			r.expectedPlayers = 0
 		}
 	}
-	ids := make([]int, 0, r.playerCount)
-	for i := 0; i < config.MaxRoomPlayers; i++ {
-		if r.playerIDs[i] >= 0 {
-			ids = append(ids, r.playerIDs[i])
-		}
-	}
+	members := r.membersLocked()
 	r.mu.Unlock()
 
 	alive := 0
 	lastAlive := -1
-	for _, id := range ids {
-		p := r.srv.findPlayerByID(id)
-		if p == nil {
-			continue
-		}
+	for _, p := range members {
 		p.mu.Lock()
 		if p.status == StatusGaming && p.hp > 0 {
 			alive++
@@ -388,11 +366,7 @@ func (r *Room) broadcastState() {
 	var pb, ib strings.Builder
 	firstPlayer := true
 	for i := 0; i < config.MaxRoomPlayers; i++ {
-		id := r.playerIDs[i]
-		if id < 0 {
-			continue
-		}
-		p := r.srv.findPlayerByID(id)
+		p := r.members[i]
 		if p == nil {
 			continue
 		}
@@ -445,21 +419,14 @@ func (r *Room) gameLoop() {
 		r.mu.Lock()
 		running := r.running
 		status := r.status
-		ids := make([]int, 0, r.playerCount)
-		for i := 0; i < config.MaxRoomPlayers; i++ {
-			if r.playerIDs[i] >= 0 {
-				ids = append(ids, r.playerIDs[i])
-			}
-		}
+		members := r.membersLocked()
 		r.mu.Unlock()
 		if !running || status != RoomGaming {
 			break
 		}
 
-		for _, id := range ids {
-			if p := r.srv.findPlayerByID(id); p != nil {
-				r.updateBuffs(p)
-			}
+		for _, p := range members {
+			r.updateBuffs(p)
 		}
 		r.updatePoison()
 		r.applyPoisonDamage()
@@ -483,23 +450,14 @@ func (r *Room) endGame(winnerID int) {
 	r.mu.Lock()
 	r.status = RoomEnded
 	r.running = false
-	ids := make([]int, 0, r.playerCount)
-	for i := 0; i < config.MaxRoomPlayers; i++ {
-		if r.playerIDs[i] >= 0 {
-			ids = append(ids, r.playerIDs[i])
-		}
-	}
+	members := r.membersLocked()
 	r.wal.write(walGameEnd, fmt.Sprintf("winner=%d", winnerID))
 	r.wal.sync()
 	r.mu.Unlock()
 
 	r.broadcast(protocol.BuildGameEnd(winnerID, ""))
 
-	for _, id := range ids {
-		p := r.srv.findPlayerByID(id)
-		if p == nil {
-			continue
-		}
+	for _, p := range members {
 		p.mu.Lock()
 		username := p.username
 		p.status = StatusInRoom
@@ -516,7 +474,7 @@ func (r *Room) endGame(winnerID int) {
 		// Record win/loss stats (storage_update_stats). winnerID == -1 is a
 		// draw/timeout, so everyone takes a loss.
 		if username != "" {
-			r.srv.store.updateStats(username, id == winnerID)
+			r.srv.store.updateStats(username, p.id == winnerID)
 		}
 	}
 
