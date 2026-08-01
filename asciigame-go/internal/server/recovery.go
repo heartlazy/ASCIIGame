@@ -263,7 +263,7 @@ func (s *Server) createRecoveryRoom(pr *pendingRecovery) *Room {
 		if room.itemCount >= config.MaxMapItems {
 			break
 		}
-		room.items[room.itemCount] = mapItem{x: it.x, y: it.y, typ: it.typ, active: true}
+		room.items[room.itemCount] = mapItem{x: it.x, y: it.y, typ: it.typ, active: true, spawnTime: now}
 		room.itemCount++
 	}
 	room.mu.Unlock()

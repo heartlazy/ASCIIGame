@@ -243,11 +243,24 @@ func (r *Room) spawnItems() {
 		return
 	}
 	x, y := mapRandomItemPosition(&r.m)
-	r.items[slot] = mapItem{x: x, y: y, typ: randItemType(), active: true}
+	r.items[slot] = mapItem{x: x, y: y, typ: randItemType(), active: true, spawnTime: now}
 	if slot >= r.itemCount {
 		r.itemCount = slot + 1
 	}
 	r.wal.write(walItemSpawn, fmt.Sprintf("type=%d,x=%d,y=%d", int(r.items[slot].typ), x, y))
+}
+
+// expireItems removes items that have been on the map longer than
+// ItemExpireTime without being picked up.
+func (r *Room) expireItems() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := nowMS()
+	for i := 0; i < r.itemCount; i++ {
+		if r.items[i].active && now-r.items[i].spawnTime >= config.ItemExpireTime {
+			r.items[i].active = false
+		}
+	}
 }
 
 // updatePoison mirrors game_update_poison (game.c:452-492).
@@ -430,6 +443,7 @@ func (r *Room) gameLoop() {
 		r.updatePoison()
 		r.applyPoisonDamage()
 		r.spawnItems()
+		r.expireItems()
 		if r.snapshotShouldSave() {
 			r.snapshotSave()
 		}

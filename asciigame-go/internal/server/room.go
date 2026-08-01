@@ -20,11 +20,13 @@ const (
 	RoomEnded
 )
 
-// mapItem mirrors the C MapItem (map.h:34-38).
+// mapItem mirrors the C MapItem (map.h:34-38), extended with spawn time for
+// expiration.
 type mapItem struct {
-	x, y   int
-	typ    ItemType
-	active bool
+	x, y      int
+	typ       ItemType
+	active    bool
+	spawnTime int64 // millisecond timestamp when this item appeared
 }
 
 // Room mirrors the C Room (room.h:27-63). Fields are guarded by mu. The
@@ -254,17 +256,17 @@ func (r *Room) startGame() int {
 	mapGenerate(&r.m)
 	r.poisonRadius = mapInitialPoisonRadius()
 
+	now := nowMS()
 	r.itemCount = 0
 	for y := 0; y < config.MapHeight && r.itemCount < config.MaxMapItems; y++ {
 		for x := 0; x < config.MapWidth && r.itemCount < config.MaxMapItems; x++ {
 			if r.m[y][x] == cellSpawn {
-				r.items[r.itemCount] = mapItem{x: x, y: y, typ: ItemType(rand.IntN(3) + 1), active: true}
+				r.items[r.itemCount] = mapItem{x: x, y: y, typ: ItemType(rand.IntN(3) + 1), active: true, spawnTime: now}
 				r.itemCount++
 			}
 		}
 	}
 
-	now := nowMS()
 	r.gameStartTime = now
 	r.lastItemSpawn = now
 	r.lastPoisonShrink = now

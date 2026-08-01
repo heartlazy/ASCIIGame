@@ -51,6 +51,7 @@ const (
 	PoisonDamage         = 5     // per second
 
 	ItemSpawnInterval = 10000  // ms
+	ItemExpireTime    = 30000  // ms, items disappear after 30s if not picked up
 	GameMaxDuration   = 300000 // ms, 5 min
 
 	HealthRestore   = 30
