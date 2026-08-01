@@ -84,12 +84,15 @@ require (
 
 ## 阶段 4 待办清单
 
-在 Linux 环境下按顺序执行：
+**大部分已完成**（2026-08-01）：代码审查（`/code-review` 修复内存泄漏 + tick 分配）、性能基准、CLAUDE.md、GOGC 调优、慢客户端/优雅关闭/战绩/bcrypt/Ticker/Room []*Player 重构、以及一次静态并发审查（发现并修复了 snapshotSave 对 r.wal 字段的 off-lock 读竞争）。**唯一仍需 Linux 的是 4.1 的 `go test -race`**（Windows 无 cgo）。
 
 ### 4.1 竞态检测（必须在 Linux 上跑）
+
+已做过一次静态并发审查：锁序（room.mu → player.mu，注册表为叶子锁）全程正确；已修复 `snapshot.go` 中对 `r.wal` 指针的 off-lock 读（现在在锁内捕获局部变量）。仍需在 Linux 上用 race detector 复核动态路径：
+
 ```bash
 cd asciigame-go
-go test -race ./...           # 全量竞态检测
+go test -race ./...           # 全量竞态检测（Makefile: make test-race）
 go build -race -o bin/server-race ./cmd/server   # 出 race 版服务端
 # 用 race 版服务端跑一遍 Python 测试：
 ./bin/server-race 8888 &

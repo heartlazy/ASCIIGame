@@ -97,6 +97,7 @@ func (r *Room) snapshotSave() {
 		}
 	}
 	members := r.membersLocked()
+	w := r.wal // capture under lock; destroyRoom may nil it from another goroutine
 	r.mu.Unlock()
 
 	for _, p := range members {
@@ -120,26 +121,28 @@ func (r *Room) snapshotSave() {
 	r.mu.Unlock()
 
 	// Keep the WAL small and self-contained: truncate, then rewrite the full
-	// current state as a checkpoint (snapshot.c:219-263).
-	if r.wal != nil {
-		r.wal.truncate()
-		r.wal.write(walCheckpoint, fmt.Sprintf("snapshot_time=%d,room_name=%s,poison_radius=%d", now, snap.RoomName, snap.PoisonRadius))
+	// current state as a checkpoint (snapshot.c:219-263). Use the pointer
+	// captured under the room lock above; wal methods are nil-safe and
+	// internally synchronized.
+	if w != nil {
+		w.truncate()
+		w.write(walCheckpoint, fmt.Sprintf("snapshot_time=%d,room_name=%s,poison_radius=%d", now, snap.RoomName, snap.PoisonRadius))
 		for _, sp := range snap.Players {
 			remain := int64(0)
 			if sp.AtkBuffExpire > now {
 				remain = sp.AtkBuffExpire - now
 			}
-			r.wal.write(walPlayerJoin, fmt.Sprintf(
+			w.write(walPlayerJoin, fmt.Sprintf(
 				"pid=%d,username=%s,x=%d,y=%d,hp=%d,max_hp=%d,atk=%d,def=%d,base_atk=%d,shield=%d,atk_buff_remain=%d,inv=%d,%d,%d,%d,%d",
 				sp.ID, sp.Username, sp.X, sp.Y, sp.HP, sp.MaxHP, sp.ATK, sp.DEF, sp.BaseATK,
 				boolToInt(sp.HasShield), remain,
 				int(sp.Inventory[0]), int(sp.Inventory[1]), int(sp.Inventory[2]), int(sp.Inventory[3]), int(sp.Inventory[4])))
 		}
 		for _, it := range snap.Items {
-			r.wal.write(walItemSpawn, fmt.Sprintf("type=%d,x=%d,y=%d", int(it.Type), it.X, it.Y))
+			w.write(walItemSpawn, fmt.Sprintf("type=%d,x=%d,y=%d", int(it.Type), it.X, it.Y))
 		}
-		r.wal.write(walPoisonShrink, fmt.Sprintf("radius=%d", snap.PoisonRadius))
-		r.wal.sync()
+		w.write(walPoisonShrink, fmt.Sprintf("radius=%d", snap.PoisonRadius))
+		w.sync()
 	}
 }
 
