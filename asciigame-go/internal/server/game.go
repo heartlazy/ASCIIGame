@@ -435,6 +435,12 @@ func (r *Room) gameLoop() {
 	r.running = true
 	r.mu.Unlock()
 
+	// A Ticker keeps a steady 20 tick/s cadence: unlike Sleep(50ms), the period
+	// does not drift by the per-tick processing time, and ticks missed under
+	// load are dropped rather than piling up.
+	ticker := time.NewTicker(config.TickIntervalMS * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
 		r.mu.Lock()
 		running := r.running
@@ -467,7 +473,7 @@ func (r *Room) gameLoop() {
 		}
 		r.broadcastState()
 
-		time.Sleep(config.TickIntervalMS * time.Millisecond)
+		<-ticker.C
 	}
 }
 

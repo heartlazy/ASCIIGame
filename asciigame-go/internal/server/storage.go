@@ -2,11 +2,15 @@ package server
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/heartlazyli/asciigame/internal/config"
 )
@@ -15,8 +19,10 @@ import (
 // 128-byte binary records in data/users.dat; the Go port uses JSON (per the
 // port plan) since the store is internal and not exercised by the wire tests.
 type userRecord struct {
-	Username     string `json:"username"`
-	PasswordHash string `json:"password_hash"` // SHA-256 hex, matches C sha256()
+	Username string `json:"username"`
+	// PasswordHash is a bcrypt hash ("$2..."). Records written by older builds
+	// hold a bare SHA-256 hex digest and are upgraded to bcrypt on next login.
+	PasswordHash string `json:"password_hash"`
 	Wins         int    `json:"wins"`
 	Losses       int    `json:"losses"`
 	Points       int    `json:"points"`
@@ -37,11 +43,33 @@ func newStorage(path string) (*storage, error) {
 	return s, nil
 }
 
-// hashPassword returns the SHA-256 hex digest, byte-identical to the C sha256()
-// used for password_hash.
+// hashPassword returns a bcrypt hash of the password.
 func hashPassword(password string) string {
+	h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		// bcrypt only errors on >72-byte inputs; passwords are capped well
+		// below that (MaxPassword), so this is effectively unreachable.
+		return ""
+	}
+	return string(h)
+}
+
+// legacySHA256 returns the old, unsalted SHA-256 hex digest used by earlier
+// builds (and the C server), kept only for verifying pre-bcrypt records.
+func legacySHA256(password string) string {
 	sum := sha256.Sum256([]byte(password))
 	return hex.EncodeToString(sum[:])
+}
+
+// checkPassword verifies password against stored hash. It returns ok and
+// whether the stored hash is a legacy SHA-256 that should be upgraded.
+func checkPassword(stored, password string) (ok, legacy bool) {
+	if strings.HasPrefix(stored, "$2") { // bcrypt
+		return bcrypt.CompareHashAndPassword([]byte(stored), []byte(password)) == nil, false
+	}
+	// Legacy unsalted SHA-256 hex (constant-time compare).
+	match := subtle.ConstantTimeCompare([]byte(stored), []byte(legacySHA256(password))) == 1
+	return match, match
 }
 
 // register mirrors storage_register_user (storage.c:174-232):
@@ -67,6 +95,9 @@ func (s *storage) register(username, password string) int {
 // verify mirrors storage_verify_user (storage.c:234-266):
 //
 //	0  ok, -1 user not found, -2 wrong password.
+//
+// On a successful login against a legacy SHA-256 record, the stored hash is
+// transparently upgraded to bcrypt.
 func (s *storage) verify(username, password string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -74,8 +105,15 @@ func (s *storage) verify(username, password string) int {
 	if !ok {
 		return -1
 	}
-	if u.PasswordHash != hashPassword(password) {
+	match, legacy := checkPassword(u.PasswordHash, password)
+	if !match {
 		return -2
+	}
+	if legacy {
+		if h := hashPassword(password); h != "" {
+			u.PasswordHash = h
+			_ = s.saveLocked()
+		}
 	}
 	return 0
 }
