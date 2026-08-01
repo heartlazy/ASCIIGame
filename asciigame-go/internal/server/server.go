@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/heartlazyli/asciigame/internal/protocol"
 )
@@ -79,6 +80,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		if err != nil {
 			select {
 			case <-ctx.Done():
+				s.shutdown()
 				return nil
 			default:
 				log.Printf("accept error: %v", err)
@@ -89,6 +91,44 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			_ = tcp.SetNoDelay(true) // match C TCP_NODELAY
 		}
 		go s.handleConn(ctx, conn)
+	}
+}
+
+// shutdown performs graceful cleanup after the listener stops: stop each room's
+// game loop and flush its WAL (so no logged events are lost and crash recovery
+// stays intact on restart), notify connected players with KICK, and close their
+// connections. Mirrors the C graceful_shutdown (main.c:186-200).
+func (s *Server) shutdown() {
+	log.Printf("shutting down: flushing rooms and disconnecting clients")
+
+	s.rmu.RLock()
+	rooms := make([]*Room, 0, len(s.rooms))
+	for _, r := range s.rooms {
+		rooms = append(rooms, r)
+	}
+	s.rmu.RUnlock()
+	for _, r := range rooms {
+		r.mu.Lock()
+		r.running = false // signal the game loop to exit on its next tick
+		r.wal.sync()      // persist buffered WAL records
+		r.mu.Unlock()
+	}
+
+	s.pmu.RLock()
+	players := make([]*Player, 0, len(s.players))
+	for _, p := range s.players {
+		players = append(players, p)
+	}
+	s.pmu.RUnlock()
+	for _, p := range players {
+		p.Send(protocol.BuildKick("Server shutting down"))
+	}
+
+	// Give the writer goroutines a brief moment to flush the KICK frame before
+	// tearing the sockets down.
+	time.Sleep(100 * time.Millisecond)
+	for _, p := range players {
+		p.shutdown()
 	}
 }
 
