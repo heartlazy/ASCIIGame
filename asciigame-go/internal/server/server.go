@@ -28,7 +28,8 @@ type Server struct {
 	rooms      map[int]*Room
 	nextRoomID int
 
-	store *storage
+	store  *storage
+	tokens *tokenStore
 
 	// Recovery registry, populated by RecoverAll on startup and consumed as
 	// players log back in.
@@ -50,6 +51,7 @@ func New(storagePath string) (*Server, error) {
 		rooms:         make(map[int]*Room),
 		nextRoomID:    1,
 		store:         st,
+		tokens:        newTokenStore(),
 		pending:       make(map[int]*pendingRecovery),
 		recByUser:     make(map[string]int),
 		recRoomByOrig: make(map[int]int),

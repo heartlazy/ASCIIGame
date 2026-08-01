@@ -64,46 +64,19 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 	return f, nil
 }
 
-// ---- Constructors: each returns a *Frame with the right payload set. ----
-// Keeping the verbose oneof wrapper syntax here makes call sites readable.
+// ---- TCP Frame constructors: only messages that travel as protobuf frames. ----
 
-func NewLogin(username, password string) *Frame {
-	return &Frame{Payload: &Frame_Login{Login: &Login{Username: username, Password: password}}}
-}
-
-func NewRegister(username, password string) *Frame {
-	return &Frame{Payload: &Frame_Register{Register: &Register{Username: username, Password: password}}}
-}
-
-func NewListRooms() *Frame { return &Frame{Payload: &Frame_ListRooms{ListRooms: &ListRooms{}}} }
-
-func NewCreateRoom(name string, maxPlayers int32) *Frame {
-	return &Frame{Payload: &Frame_CreateRoom{CreateRoom: &CreateRoom{Name: name, MaxPlayers: maxPlayers}}}
-}
-
-func NewJoinRoom(roomID int32) *Frame {
-	return &Frame{Payload: &Frame_JoinRoom{JoinRoom: &JoinRoom{RoomId: roomID}}}
-}
-
-func NewLeaveRoom() *Frame  { return &Frame{Payload: &Frame_LeaveRoom{LeaveRoom: &LeaveRoom{}}} }
-func NewReady() *Frame      { return &Frame{Payload: &Frame_Ready{Ready: &Ready{}}} }
-func NewAttack() *Frame     { return &Frame{Payload: &Frame_Attack{Attack: &Attack{}}} }
-func NewLogout() *Frame     { return &Frame{Payload: &Frame_Logout{Logout: &Logout{}}} }
-func NewGameStart() *Frame  { return &Frame{Payload: &Frame_GameStart{GameStart: &GameStart{}}} }
-
+// Client -> Server (TCP)
+func NewAuth(token string) *Frame { return &Frame{Payload: &Frame_Auth{Auth: &Auth{Token: token}}} }
 func NewMove(direction string) *Frame {
 	return &Frame{Payload: &Frame_Move{Move: &Move{Direction: direction}}}
 }
-
+func NewAttack() *Frame            { return &Frame{Payload: &Frame_Attack{Attack: &Attack{}}} }
 func NewUseItem(index int32) *Frame {
 	return &Frame{Payload: &Frame_UseItem{UseItem: &UseItem{Index: index}}}
 }
 
-func NewChat(message string) *Frame {
-	return &Frame{Payload: &Frame_Chat{Chat: &Chat{Message: message}}}
-}
-
-// NewOk acknowledges a command. Pass playerID>0 only for a successful login.
+// Server -> Client (TCP push)
 func NewOk(message string, playerID int32) *Frame {
 	return &Frame{Payload: &Frame_Ok{Ok: &Ok{Message: message, PlayerId: playerID}}}
 }
