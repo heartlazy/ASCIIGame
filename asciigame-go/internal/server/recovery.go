@@ -408,7 +408,13 @@ func replayWAL(path string) *recoveryState {
 						p.hp = p.maxHP
 					}
 				case ItemAttack:
-					p.atk = config.InitialATK + config.AtkBuffAmount
+					p.atk = p.baseATK + config.AtkBuffAmount
+					if remain := int64(atoi(kv["atk_buff_remain"])); remain > 0 {
+						p.atkBuffExpire = nowMS() + remain
+					} else {
+						// Fallback: old WAL without atk_buff_remain field.
+						p.atkBuffExpire = nowMS() + config.AtkBuffDuration
+					}
 				case ItemShield:
 					p.hasShield = true
 				}

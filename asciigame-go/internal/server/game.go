@@ -200,7 +200,6 @@ func (r *Room) handleUseItem(p *Player, index int) int {
 	if t == ItemNone {
 		return -1
 	}
-	r.wal.write(walUseItem, fmt.Sprintf("pid=%d,item=%d,idx=%d", p.id, int(t), index))
 
 	p.mu.Lock()
 	switch t {
@@ -217,6 +216,13 @@ func (r *Room) handleUseItem(p *Player, index int) int {
 		p.hasShield = true
 	}
 	p.mu.Unlock()
+
+	// WAL: include atk_buff_remain so recovery can restore the expiry.
+	buffRemain := int64(0)
+	if t == ItemAttack {
+		buffRemain = config.AtkBuffDuration
+	}
+	r.wal.write(walUseItem, fmt.Sprintf("pid=%d,item=%d,idx=%d,atk_buff_remain=%d", p.id, int(t), index, buffRemain))
 	return 0
 }
 

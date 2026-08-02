@@ -292,10 +292,15 @@ func (r *Room) startGame() int {
 
 	// Persist initial game state to the WAL (room_start_game, room.c:406-442).
 	r.wal.write(walGameStart, fmt.Sprintf("room_name=%s,max_players=%d", r.name, r.maxPlayers))
+	now2 := nowMS()
 	for _, p := range ids {
 		p.mu.Lock()
-		rec := fmt.Sprintf("pid=%d,username=%s,x=%d,y=%d,hp=%d,max_hp=%d,atk=%d,def=%d,shield=%d,inv=%d,%d,%d,%d,%d",
-			p.id, p.username, p.x, p.y, p.hp, p.maxHP, p.atk, p.def, boolToInt(p.hasShield),
+		buffRemain := int64(0)
+		if p.atkBuffExpire > now2 {
+			buffRemain = p.atkBuffExpire - now2
+		}
+		rec := fmt.Sprintf("pid=%d,username=%s,x=%d,y=%d,hp=%d,max_hp=%d,atk=%d,def=%d,base_atk=%d,shield=%d,atk_buff_remain=%d,inv=%d,%d,%d,%d,%d",
+			p.id, p.username, p.x, p.y, p.hp, p.maxHP, p.atk, p.def, p.baseATK, boolToInt(p.hasShield), buffRemain,
 			int(p.inventory[0]), int(p.inventory[1]), int(p.inventory[2]), int(p.inventory[3]), int(p.inventory[4]))
 		p.mu.Unlock()
 		r.wal.write(walPlayerJoin, rec)
