@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/heartlazyli/asciigame/internal/config"
@@ -18,8 +17,9 @@ type UI struct {
 	app   *tview.Application
 	pages *tview.Pages
 	state *State
-	conn  *Conn
-	addr  string
+	http  *HTTPClient // HTTP API for lobby/room operations
+	conn  *Conn       // TCP for real-time game frames
+	tcpAddr string    // TCP server address (host:port)
 
 	status *tview.TextView
 	world  *tview.TextView
@@ -28,16 +28,17 @@ type UI struct {
 	game   *tview.Flex
 
 	username  string
-	connected atomic.Bool
+	connected atomic.Bool // TCP connected
 }
 
-// NewUI builds the UI targeting server addr (host:port).
-func NewUI(addr string) *UI {
+// NewUI builds the UI targeting the given HTTP base URL and TCP address.
+func NewUI(httpBase, tcpAddr string) *UI {
 	u := &UI{
-		app:   tview.NewApplication(),
-		pages: tview.NewPages(),
-		state: NewState(),
-		addr:  addr,
+		app:     tview.NewApplication(),
+		pages:   tview.NewPages(),
+		state:   NewState(),
+		http:    NewHTTPClient(httpBase),
+		tcpAddr: tcpAddr,
 	}
 	u.buildGamePage()
 	u.buildLoginPage()
@@ -99,13 +100,18 @@ func (u *UI) buildGamePage() {
 	})
 }
 
-// ensureConn establishes the TCP connection (once) and starts the read loop.
-func (u *UI) ensureConn() error {
+// ensureTCP establishes the TCP connection, authenticates with the token, and
+// starts the read loop for game pushes.
+func (u *UI) ensureTCP() error {
 	if u.conn != nil {
 		return nil
 	}
-	c, err := Dial(u.addr)
+	c, err := Dial(u.tcpAddr)
 	if err != nil {
+		return err
+	}
+	if err := c.Authenticate(u.http.Token()); err != nil {
+		_ = c.Close()
 		return err
 	}
 	u.conn = c
@@ -114,122 +120,88 @@ func (u *UI) ensureConn() error {
 	return nil
 }
 
-// doLogin connects and sends LOGIN, then waits for server response before
-// transitioning to the game page. Shows an error modal on failure.
+// doLogin uses the HTTP API to register (optionally) + login, then connects TCP.
 func (u *UI) doLogin(username, password string) {
 	if username == "" || password == "" {
 		u.showModal("Username and password required.")
 		return
 	}
-	if err := u.ensureConn(); err != nil {
-		u.showModal(fmt.Sprintf("Failed to connect: %v", err))
-		return
-	}
-	_ = u.conn.Send(protocol.NewLogin(username, password))
+	go func() {
+		pid, errMsg, err := u.http.Login(username, password)
+		if err != nil {
+			u.app.QueueUpdateDraw(func() { u.showModal("Connection error: " + err.Error()) })
+			return
+		}
+		if errMsg != "" {
+			u.app.QueueUpdateDraw(func() { u.showModal("Login failed: " + errMsg) })
+			return
+		}
+		u.username = username
+		u.state.mu.Lock()
+		u.state.username = username
+		u.state.myID = pid
+		u.state.loggedIn = true
+		u.state.mu.Unlock()
 
-	// Wait briefly for the server response (the read goroutine updates state).
-	u.username = username
-	u.state.mu.Lock()
-	u.state.username = username
-	u.state.mu.Unlock()
-
-	go u.waitForLoginResult(username)
+		// Establish TCP for game pushes.
+		if err := u.ensureTCP(); err != nil {
+			u.app.QueueUpdateDraw(func() { u.showModal("TCP connect failed: " + err.Error()) })
+			return
+		}
+		u.app.QueueUpdateDraw(func() {
+			u.pages.SwitchToPage("game")
+			u.app.SetFocus(u.game)
+			u.render()
+		})
+	}()
 }
 
-// doRegisterAndLogin sends REGISTER, waits for success, then sends LOGIN.
+// doRegisterAndLogin registers via HTTP then logs in.
 func (u *UI) doRegisterAndLogin(username, password string) {
 	if username == "" || password == "" {
 		u.showModal("Username and password required.")
 		return
 	}
-	if err := u.ensureConn(); err != nil {
-		u.showModal(fmt.Sprintf("Failed to connect: %v", err))
-		return
-	}
-	u.username = username
-	u.state.mu.Lock()
-	u.state.username = username
-	u.state.mu.Unlock()
-
-	_ = u.conn.Send(protocol.NewRegister(username, password))
-
-	// Wait for register response, then login.
 	go func() {
-		if !u.waitForResponse("Registration successful", "Register failed") {
+		errMsg, err := u.http.Register(username, password)
+		if err != nil {
+			u.app.QueueUpdateDraw(func() { u.showModal("Connection error: " + err.Error()) })
 			return
 		}
-		_ = u.conn.Send(protocol.NewLogin(username, password))
-		u.waitForLoginResult(username)
+		if errMsg != "" {
+			u.app.QueueUpdateDraw(func() { u.showModal("Register failed: " + errMsg) })
+			return
+		}
+		// Now login.
+		pid, errMsg, err := u.http.Login(username, password)
+		if err != nil {
+			u.app.QueueUpdateDraw(func() { u.showModal("Connection error: " + err.Error()) })
+			return
+		}
+		if errMsg != "" {
+			u.app.QueueUpdateDraw(func() { u.showModal("Login failed: " + errMsg) })
+			return
+		}
+		u.username = username
+		u.state.mu.Lock()
+		u.state.username = username
+		u.state.myID = pid
+		u.state.loggedIn = true
+		u.state.mu.Unlock()
+
+		if err := u.ensureTCP(); err != nil {
+			u.app.QueueUpdateDraw(func() { u.showModal("TCP connect failed: " + err.Error()) })
+			return
+		}
+		u.app.QueueUpdateDraw(func() {
+			u.pages.SwitchToPage("game")
+			u.app.SetFocus(u.game)
+			u.render()
+		})
 	}()
 }
 
-// waitForLoginResult polls state for up to 3s to see if login succeeded (myID
-// was set by the OK handler), or if an error message appeared.
-func (u *UI) waitForLoginResult(username string) {
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-		u.state.mu.Lock()
-		id := u.state.myID
-		msgs := u.state.messages
-		u.state.mu.Unlock()
-		if id > 0 {
-			// Login succeeded — switch to game page on the UI thread.
-			u.state.mu.Lock()
-			u.state.loggedIn = true
-			u.state.mu.Unlock()
-			u.app.QueueUpdateDraw(func() {
-				u.pages.SwitchToPage("game")
-				u.app.SetFocus(u.game)
-				u.render()
-			})
-			return
-		}
-		// Check if an error appeared.
-		if len(msgs) > 0 {
-			last := msgs[len(msgs)-1]
-			if last.sender == "Error" {
-				u.app.QueueUpdateDraw(func() {
-					u.showModal("Login failed: " + last.text)
-				})
-				return
-			}
-		}
-	}
-	u.app.QueueUpdateDraw(func() {
-		u.showModal("Login timed out — no server response.")
-	})
-}
-
-// waitForResponse polls state for up to 3s for a message containing success,
-// or shows failMsg on error. Returns true if success was found.
-func (u *UI) waitForResponse(successSubstr, failMsg string) bool {
-	deadline := time.Now().Add(3 * time.Second)
-	startMsgCount := u.state.MessageCount()
-	for time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-		u.state.mu.Lock()
-		msgs := u.state.messages
-		u.state.mu.Unlock()
-		for i := startMsgCount; i < len(msgs); i++ {
-			if msgs[i].sender == "Error" {
-				u.app.QueueUpdateDraw(func() {
-					u.showModal(failMsg + ": " + msgs[i].text)
-				})
-				return false
-			}
-			if strings.Contains(msgs[i].text, successSubstr) {
-				return true
-			}
-		}
-	}
-	u.app.QueueUpdateDraw(func() {
-		u.showModal(failMsg + ": timed out")
-	})
-	return false
-}
-
-// onMsg runs on the read goroutine: update state, then redraw on the UI thread.
+// onMsg runs on the TCP read goroutine: update state, then redraw on the UI thread.
 func (u *UI) onMsg(f *protocol.Frame) {
 	debugf("recv %s", frameName(f))
 	if u.state.Update(f) {
@@ -314,11 +286,20 @@ func (u *UI) gameKey(ev *tcell.EventKey) {
 	case '1', '2', '3', '4', '5':
 		u.send(protocol.NewUseItem(int32(ev.Rune() - '1')))
 	case 'q', 'Q':
-		u.send(protocol.NewLeaveRoom())
+		go func() {
+			_, _ = u.http.LeaveRoom()
+			u.state.mu.Lock()
+			u.state.inGame = false
+			u.state.inRoom = false
+			u.state.roomID = -1
+			u.state.addMessage("System", "Left room")
+			u.state.mu.Unlock()
+			u.app.QueueUpdateDraw(u.render)
+		}()
 	case 't', 'T':
 		u.prompt("Chat", func(text string) {
 			if strings.TrimSpace(text) != "" {
-				u.send(protocol.NewChat(text))
+				go u.http.Chat(text)
 			}
 		})
 	}
@@ -327,13 +308,34 @@ func (u *UI) gameKey(ev *tcell.EventKey) {
 func (u *UI) roomKey(ev *tcell.EventKey) {
 	switch ev.Rune() {
 	case 'r', 'R':
-		u.send(protocol.NewReady())
+		go func() {
+			msg, started, errMsg, _ := u.http.Ready()
+			u.state.mu.Lock()
+			if errMsg != "" {
+				u.state.addMessage("Error", errMsg)
+			} else {
+				u.state.addMessage("Server", msg)
+				if started {
+					u.state.addMessage("System", "All ready! Game starting...")
+				}
+			}
+			u.state.mu.Unlock()
+			u.app.QueueUpdateDraw(u.render)
+		}()
 	case 'l', 'L':
-		u.send(protocol.NewLeaveRoom())
+		go func() {
+			_, _ = u.http.LeaveRoom()
+			u.state.mu.Lock()
+			u.state.inRoom = false
+			u.state.roomID = -1
+			u.state.addMessage("System", "Left room")
+			u.state.mu.Unlock()
+			u.app.QueueUpdateDraw(u.render)
+		}()
 	case 't', 'T':
 		u.prompt("Chat", func(text string) {
 			if strings.TrimSpace(text) != "" {
-				u.send(protocol.NewChat(text))
+				go u.http.Chat(text)
 			}
 		})
 	}
@@ -346,28 +348,67 @@ func (u *UI) lobbyKey(ev *tcell.EventKey) {
 			if strings.TrimSpace(name) == "" {
 				name = "Room"
 			}
-			u.send(protocol.NewCreateRoom(name, 6))
+			go func() {
+				room, errMsg, _ := u.http.CreateRoom(name, 6)
+				u.state.mu.Lock()
+				if errMsg != "" {
+					u.state.addMessage("Error", errMsg)
+				} else {
+					u.state.inRoom = true
+					u.state.roomID = int(getFloat(room, "room_id"))
+					u.state.roomName = getStr(room, "name")
+					u.state.addMessage("System", fmt.Sprintf("Created room %s (ID=%d)", u.state.roomName, u.state.roomID))
+				}
+				u.state.mu.Unlock()
+				u.app.QueueUpdateDraw(u.render)
+			}()
 		})
 	case 'l', 'L':
-		u.state.mu.Lock()
-		u.state.addMessage("System", "Requesting room list...")
-		u.state.mu.Unlock()
-		u.send(protocol.NewListRooms())
-		u.render()
+		go func() {
+			rooms, err := u.http.ListRooms()
+			u.state.mu.Lock()
+			if err != nil {
+				u.state.addMessage("Error", err.Error())
+			} else if len(rooms) == 0 {
+				u.state.addMessage("System", "No rooms available. Press C to create one.")
+			} else {
+				u.state.addMessage("System", "=== Room List ===")
+				for _, r := range rooms {
+					u.state.addMessage("", fmt.Sprintf("  ID=%d  name='%s'  (%d/%d)  status=%d",
+						int(getFloat(r, "room_id")), getStr(r, "name"),
+						int(getFloat(r, "player_count")), int(getFloat(r, "max_players")),
+						int(getFloat(r, "status"))))
+				}
+				u.state.addMessage("System", "Press J and enter the ID number to join")
+			}
+			u.state.mu.Unlock()
+			u.app.QueueUpdateDraw(u.render)
+		}()
 	case 'j', 'J':
 		u.prompt("Room ID (number)", func(text string) {
 			text = strings.TrimSpace(text)
 			id := atoi(text)
 			if id <= 0 {
-				// Give feedback instead of silently doing nothing — users
-				// often type the room name here by mistake.
 				u.state.mu.Lock()
 				u.state.addMessage("Error", "Enter the numeric room ID (e.g. 1), not the name. Press L to list.")
 				u.state.mu.Unlock()
 				u.render()
 				return
 			}
-			u.send(protocol.NewJoinRoom(int32(id)))
+			go func() {
+				room, errMsg, _ := u.http.JoinRoom(id)
+				u.state.mu.Lock()
+				if errMsg != "" {
+					u.state.addMessage("Error", errMsg)
+				} else {
+					u.state.inRoom = true
+					u.state.roomID = int(getFloat(room, "room_id"))
+					u.state.roomName = getStr(room, "name")
+					u.state.addMessage("System", fmt.Sprintf("Joined room %s (ID=%d)", u.state.roomName, u.state.roomID))
+				}
+				u.state.mu.Unlock()
+				u.app.QueueUpdateDraw(u.render)
+			}()
 		})
 	}
 }

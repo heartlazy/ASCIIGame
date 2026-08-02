@@ -2,15 +2,28 @@
 
 ## Project Overview
 
-Go port of the ASCII Battle Royale multiplayer terminal game. Originally ~7900 lines of C (epoll+pthread+ncurses), now reimplemented in idiomatic Go.
+Go port of the ASCII Battle Royale multiplayer terminal game. Dual-protocol architecture: HTTP API (Gin) for lobby/room operations, TCP (protobuf) for real-time game I/O.
 
 Module: `github.com/heartlazyli/asciigame`
 
 ## Architecture
 
-- **Server** (`cmd/server`): TCP listener, one goroutine per connection, one game-tick goroutine (50ms) per room. Shared state protected by `sync.RWMutex` (player/room registries) and per-object `sync.Mutex`.
-- **Client** (`cmd/client`): tview TUI with 4 panels (status/map/messages/help). Network goroutine feeds state updates via `QueueUpdateDraw`.
-- **Protocol** (`internal/protocol`): protobuf messages (generated from `asciigame.proto`) with length-prefix framing. A `Frame` carries a `oneof payload` discriminating all message types; `GameEvent` has a nested `oneof event`.
+**Two servers run in parallel:**
+- **HTTP API** (`:8080`, Gin): register, login (returns token), create/join/list/leave room, ready, chat, logout
+- **TCP Server** (`:8888`, protobuf + 4B length-prefix): real-time game frames only (Auth, Move, Attack, UseItem; server pushes GameStart/GameState/GameEvent/GameEnd/ChatMsg/Kick/PlayerJoin/PlayerLeave)
+
+**Flow:**
+1. Client calls `POST /api/login` → gets token + player_id
+2. Client TCP connects → sends `Auth{token}` → server validates, binds Player
+3. Client calls `POST /api/rooms/ready` → if allReady, game starts → TCP pushes `GameStart`
+4. Game: client sends Move/Attack/UseItem via TCP; server pushes state at 20Hz
+5. Game ends → TCP pushes `GameEnd` → client calls HTTP to leave/rejoin
+
+**Server internals:**
+- One goroutine per TCP connection, one game-tick goroutine (50ms) per room
+- Shared state: `sync.RWMutex` (player/room registries) + per-object `sync.Mutex`
+- Lock ordering: `room.mu` → `player.mu`; registry locks are leaf locks
+- Dirty detection: `broadcastState` skips identical periodic GAME_STATE frames
 
 ## Key Commands
 
@@ -20,35 +33,43 @@ go test ./...                     # Unit + integration tests
 go test -race ./...               # Race detector (Linux only, needs cgo)
 go build -o bin/server ./cmd/server
 go build -o bin/client ./cmd/client
+
+# Run server (TCP :8888, HTTP :8080 by default)
+./bin/server [tcp_port] [http_port]
+
+# Run client
+./bin/client [host] [tcp_port] [http_port]
 ```
 
-Regenerating protobuf code (only when `internal/protocol/asciigame.proto` changes — the generated `asciigame.pb.go` is committed):
-```bash
-protoc --proto_path=internal/protocol \
-  --go_out=internal/protocol --go_opt=paths=source_relative \
-  internal/protocol/asciigame.proto
-```
+## HTTP API Endpoints
 
-## Wire Protocol
+All authenticated endpoints require `Authorization: Bearer <token>` header.
 
-Each frame on the wire is **4-byte big-endian length + marshaled protobuf `Frame`** (see `codec.go`). The `Frame.payload` oneof discriminates the message; `GameEvent.event` is a nested oneof for attack/damage/kill/shield/pickup/poison/buff events. Typed accessors (`f.GetOk()`, `f.GetGameState()`, …) read payloads safely.
+| Method | Path | Auth | Body | Response |
+|--------|------|------|------|----------|
+| POST | /api/register | No | {username, password} | {message} |
+| POST | /api/login | No | {username, password} | {token, player_id} |
+| GET | /api/rooms | Yes | — | [{room_id, name, ...}] |
+| POST | /api/rooms | Yes | {name, max_players} | {room_id, ...} |
+| POST | /api/rooms/:id/join | Yes | — | {room_id, ...} |
+| POST | /api/rooms/leave | Yes | — | {message} |
+| POST | /api/rooms/ready | Yes | — | {message, game_started} |
+| POST | /api/chat | Yes | {message} | {message: "sent"} |
+| POST | /api/logout | Yes | — | {message} |
 
-Round-trip tests: `internal/protocol/codec_test.go`. Note: this is **not** byte-compatible with the original C text protocol — the old Python tests in `../test/` are obsolete and need rewriting against the new binary protocol.
+## TCP Protocol
 
-## Layer-1 optimization: dirty detection
+Wire format: `[4-byte big-endian uint32 length][protobuf Frame]`
 
-`broadcastState` skips the periodic GAME_STATE broadcast when the observable state (players/items/poison, excluding the ever-changing timestamp) is byte-identical to the last broadcast. Idle periods no longer flood clients at 20 Hz; any real change (move, damage, pickup, poison shrink, join/leave) alters the signature and sends. Discrete `GameEvent` frames are unaffected.
+Client sends: `Auth{token}` (first frame), then `Move{direction}` / `Attack{}` / `UseItem{index}`.
 
-## Lock Ordering
+Server pushes: `Ok` / `Error` / `GameStart` / `GameState` / `GameEvent` (oneof: Attack/Damage/Kill/Shield/AttackResult/Pickup/Poison/BuffWarning/BuffExpired) / `GameEnd` / `ChatMsg` / `Kick` / `PlayerJoin` / `PlayerLeave` / `RoomInfo`.
 
-Always: `room.mu` → `player.mu`. Registry locks (`pmu`, `rmu`) are leaf locks (never held while acquiring room/player locks). All network sends happen outside locks.
+Schema: `internal/protocol/asciigame.proto`
 
 ## Persistence
 
-- **Accounts**: SQLite (`data/game.db`) via the pure-Go `modernc.org/sqlite`
-  driver (no cgo). Passwords are bcrypt; legacy unsalted SHA-256 records (from
-  the C server / old JSON store) still verify and upgrade to bcrypt on login. A
-  legacy `data/users.json` is imported once on first startup, then renamed.
-- **WAL**: text format `TS|SEQ|ROOM|ACTION|DATA\n` (C-compatible), fsync'd every 1s. Persistence is deliberately separate from the network protocol.
-- **Snapshot**: JSON, every 20s, atomic write (tmp+rename)
-- **Recovery**: On startup, replays WAL for rooms without GAME_END; players rejoin on login
+- **Accounts**: SQLite (`data/game.db`), pure-Go driver, bcrypt passwords
+- **WAL**: text `TS|SEQ|ROOM|ACTION|DATA\n`, fsync'd every 1s
+- **Snapshot**: JSON, every 20s, atomic write
+- **Recovery**: startup replays WAL for rooms without GAME_END; TCP auth triggers rejoin

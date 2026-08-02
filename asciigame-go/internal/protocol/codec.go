@@ -77,6 +77,7 @@ func NewUseItem(index int32) *Frame {
 }
 
 // Server -> Client (TCP push)
+func NewGameStart() *Frame { return &Frame{Payload: &Frame_GameStart{GameStart: &GameStart{}}} }
 func NewOk(message string, playerID int32) *Frame {
 	return &Frame{Payload: &Frame_Ok{Ok: &Ok{Message: message, PlayerId: playerID}}}
 }

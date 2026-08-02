@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/heartlazyli/asciigame/internal/config"
 	"github.com/heartlazyli/asciigame/internal/protocol"
 )
 
@@ -139,13 +140,27 @@ func (s *Server) shutdown() {
 }
 
 // registerPlayer allocates an id and adds the player to the registry, mirroring
-// player_create's slot+id assignment.
+// player_create's slot+id assignment. Used when a TCP connection arrives.
 func (s *Server) registerPlayer(conn net.Conn) *Player {
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
 	id := s.nextPlayerID
 	s.nextPlayerID++
 	p := newPlayer(conn, id)
+	s.players[id] = p
+	return p
+}
+
+// createPlayer creates a Player with no TCP connection (used by HTTP login).
+// The TCP conn is attached later when the client connects and authenticates.
+func (s *Server) createPlayer(username string) *Player {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	id := s.nextPlayerID
+	s.nextPlayerID++
+	p := newPlayer(nil, id)
+	p.username = username
+	p.status = StatusLobby
 	s.players[id] = p
 	return p
 }
@@ -180,25 +195,79 @@ func (s *Server) findPlayerByUsername(username string) *Player {
 	return nil
 }
 
-// handleConn runs one connection: a writer goroutine drains the player's out
-// channel, and this goroutine reads length-prefixed frames and dispatches
-// them. Mirrors handle_client_data + handle_disconnect (main.c).
+// handleConn runs one TCP connection. The client must send an Auth frame
+// first (carrying the login token from HTTP /api/login); after validation
+// the connection is bound to the corresponding Player and enters the game
+// frame read loop (Move/Attack/UseItem only).
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
-	p := s.registerPlayer(conn)
-	log.Printf("player %s connected", p.label())
+	r := bufio.NewReader(conn)
 
+	// --- Phase 1: Auth handshake ---
+	f, err := protocol.ReadFrame(r)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	auth := f.GetAuth()
+	if auth == nil || auth.Token == "" {
+		_ = protocol.WriteFrame(conn, protocol.NewError(int32(config.ErrInvalidFormat), "First frame must be Auth"))
+		_ = conn.Close()
+		return
+	}
+	p := s.tokens.Validate(auth.Token)
+	if p == nil {
+		_ = protocol.WriteFrame(conn, protocol.NewError(int32(config.ErrInvalidCredentials), "Invalid token"))
+		_ = conn.Close()
+		return
+	}
+
+	// Bind TCP connection to the player (created at HTTP login time).
+	p.mu.Lock()
+	p.conn = conn
+	p.out = make(chan *protocol.Frame, 256)
+	p.done = make(chan struct{})
+	p.mu.Unlock()
+
+	log.Printf("player %s TCP connected", p.label())
 	go p.writeLoop()
 
-	defer s.disconnect(p)
+	// Push recovery GAME_START if this player has an in-progress game.
+	if origID, ok := s.checkRecovery(p.getUsername()); ok {
+		if room := s.restorePlayerToGame(p, origID); room != nil {
+			s.sendRecoveryRejoin(p, room)
+		}
+	}
 
-	r := bufio.NewReader(conn)
+	// Acknowledge successful TCP auth.
+	p.Send(protocol.NewOk("TCP connected", int32(p.id)))
+
+	// --- Phase 2: Game frame loop ---
+	defer s.disconnectTCP(p)
+
 	for {
 		f, err := protocol.ReadFrame(r)
 		if err != nil {
-			return // EOF / read error: disconnect
+			return
 		}
-		s.handle(p, f)
+		s.handleTCP(p, f)
 	}
+}
+
+// disconnectTCP handles a TCP disconnect: if the player is in a game room,
+// remove them; close the socket. The Player object stays in the registry (it
+// was created by HTTP login) until the session token expires or logout.
+func (s *Server) disconnectTCP(p *Player) {
+	p.mu.Lock()
+	roomID := p.roomID
+	p.mu.Unlock()
+
+	if roomID >= 0 {
+		if room := s.findRoomByID(roomID); room != nil {
+			room.removePlayer(p)
+		}
+	}
+	p.shutdown()
+	log.Printf("player %s TCP disconnected", p.label())
 }
 
 // writeLoop serializes all socket writes for a player.

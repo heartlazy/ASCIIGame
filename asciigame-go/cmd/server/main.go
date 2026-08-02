@@ -1,10 +1,13 @@
 // Command server runs the ASCII Battle Royale game server (Go port).
+// It starts two listeners: an HTTP API on :8080 (Gin) for lobby/room
+// operations, and a TCP server on :8888 (protobuf) for real-time game I/O.
 package main
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,20 +20,27 @@ import (
 )
 
 func main() {
-	// Raise the GC threshold to smooth the 50ms game-tick cadence (fewer, less
-	// frequent collections). Skipped if the operator set GOGC explicitly.
 	if os.Getenv("GOGC") == "" {
 		debug.SetGCPercent(200)
 	}
 
-	port := config.ServerPort
+	tcpPort := config.ServerPort // 8888
+	httpPort := 8080
 	if len(os.Args) > 1 {
 		p, err := strconv.Atoi(os.Args[1])
 		if err != nil || p <= 0 || p > 65535 {
-			fmt.Fprintf(os.Stderr, "Invalid port: %s\n", os.Args[1])
+			fmt.Fprintf(os.Stderr, "Invalid TCP port: %s\n", os.Args[1])
 			os.Exit(1)
 		}
-		port = p
+		tcpPort = p
+	}
+	if len(os.Args) > 2 {
+		p, err := strconv.Atoi(os.Args[2])
+		if err != nil || p <= 0 || p > 65535 {
+			fmt.Fprintf(os.Stderr, "Invalid HTTP port: %s\n", os.Args[2])
+			os.Exit(1)
+		}
+		httpPort = p
 	}
 
 	srv, err := server.New(filepath.FromSlash(config.UsersDB))
@@ -38,17 +48,31 @@ func main() {
 		log.Fatalf("failed to init server: %v", err)
 	}
 
-	// Rebuild any in-progress games from the WAL before accepting connections.
 	srv.RecoverAll()
 
-	// Graceful shutdown on SIGINT/SIGTERM, mirroring the C signal handler.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	log.Printf("=== ASCII Battle Royale Server (Go) ===")
-	addr := fmt.Sprintf(":%d", port)
-	if err := srv.ListenAndServe(ctx, addr); err != nil {
-		log.Fatalf("server error: %v", err)
+
+	// Start HTTP API (Gin) in background.
+	httpEngine := srv.SetupHTTP()
+	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", httpPort), Handler: httpEngine}
+	go func() {
+		log.Printf("HTTP API listening on :%d", httpPort)
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = httpSrv.Close()
+	}()
+
+	// Start TCP game server (blocks until ctx cancelled).
+	tcpAddr := fmt.Sprintf(":%d", tcpPort)
+	if err := srv.ListenAndServe(ctx, tcpAddr); err != nil {
+		log.Fatalf("TCP server error: %v", err)
 	}
 	log.Printf("server shut down")
 }

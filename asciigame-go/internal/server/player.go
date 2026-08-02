@@ -66,7 +66,7 @@ type Player struct {
 }
 
 func newPlayer(conn net.Conn, id int) *Player {
-	return &Player{
+	p := &Player{
 		conn:    conn,
 		id:      id,
 		roomID:  -1,
@@ -79,6 +79,7 @@ func newPlayer(conn net.Conn, id int) *Player {
 		out:     make(chan *protocol.Frame, 256),
 		done:    make(chan struct{}),
 	}
+	return p
 }
 
 // Send enqueues a frame for delivery. Safe for concurrent use. If the outbound
