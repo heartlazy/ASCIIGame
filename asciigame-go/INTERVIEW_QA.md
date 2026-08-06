@@ -137,6 +137,10 @@ r.broadcast(protocol.NewGameState(timestamp, players, items, int32(poison)))
 
 ## 三、WAL + 快照的崩溃恢复机制
 
+> **重要前提（务必理解，否则容易答错）**：本项目的恢复路径**只读 WAL，不读快照文件**（`recoverRoom` 只调用 `replayWAL`，`snapshotLoad` 未参与恢复流程）。快照的真正作用是**在保存时触发 WAL 截断并重写一份完整状态**，从而让 WAL 保持小巧且自包含。简历中"11 倍加速"的本质是：**快照带来的 WAL 截断**让待重放记录从 6000 条降到 400 条。
+
+---
+
 ### Q9：WAL 的格式是什么？为什么用文本格式而不是二进制？
 
 **回答：**
@@ -152,12 +156,14 @@ TIMESTAMP|SEQUENCE|ROOM_ID|ACTION_TYPE|ACTION_DATA\n
 1722480000050|43|3|DAMAGE|atk=1,vic=2,dmg=10,hp=90
 ```
 
+共 13 种 action 类型（GAME_START / PLAYER_JOIN / PLAYER_LEAVE / MOVE / ATTACK / PICKUP / USE_ITEM / DAMAGE / PLAYER_DEATH / ITEM_SPAWN / POISON_SHRINK / GAME_END / CHECKPOINT）。
+
 选文本格式有几个实际考量：
-1. **可调试**：崩溃后可以直接用 `cat` 看 WAL 内容，定位问题快。
+1. **可调试**：崩溃后可以直接用 `cat`/`grep` 看 WAL 内容，定位问题快。
 2. **与 C 版兼容**：项目是从 C 移植过来的，保持文本格式让两个版本的工具链可以互通。
 3. **追加友好**：文本的行追加是最简单的 append-only 模式，`Sync()` 语义清晰。
 
-代价是略大于二进制（同样内容可能多 30-50%），但游戏状态变化的频率决定了 WAL 增长速度不会成为问题，再加上快照截断机制，实际文件始终很小。
+代价是略大于二进制（同样内容可能多 30-50%），但配合快照截断机制，实际文件始终维持在 18KB 左右。
 
 ---
 
@@ -165,7 +171,7 @@ TIMESTAMP|SEQUENCE|ROOM_ID|ACTION_TYPE|ACTION_DATA\n
 
 **回答：**
 
-WAL 的 `Sync()` 每隔 `WalSyncIntervalMS`（1000ms，即 1 秒）调用一次，也在游戏开始/结束等关键节点强制同步。实现在 `wal.write()` 里：
+WAL 用 `bufio.Writer` 缓冲，每隔 `WalSyncIntervalMS`（1000ms）触发一次 `Flush() + f.Sync()`，也在游戏开始/结束等关键节点强制同步。实现在 `wal.write()` 里：
 
 ```go
 if now := nowMS(); now-w.lastSync >= config.WalSyncIntervalMS {
@@ -174,13 +180,15 @@ if now := nowMS(); now-w.lastSync >= config.WalSyncIntervalMS {
 }
 ```
 
-1 秒一次意味着崩溃时**最多丢失 1 秒内的操作**，对这个游戏来说可以接受（1 秒内大约 20 次移动、4-5 次攻击）。
+1 秒一次意味着崩溃时**最多丢失 1 秒内的操作**，对这个游戏来说可以接受（1 秒内大约 5 次移动、1 次攻击）。
 
 如果 fsync 更频繁（比如每条记录都 fsync）：
-- 在 HDD 上每次 fsync 约 5-10ms，20Hz 游戏每帧都 fsync 直接让 tick 超时。
+- 在 HDD 上每次 fsync 约 5-10ms，20Hz 游戏每帧都 fsync 会直接让 tick 超时。
 - 即使 SSD，频繁 fsync 也会触发写入放大，降低磁盘寿命。
 
-如果更少（比如 10 秒一次）：崩溃丢失数据更多，恢复后玩家状态差异更大，体验更差。1 秒是一个合理的平衡点，参考 etcd 的默认 WAL fsync 策略（也是批量 + 周期性 fdatasync）。
+如果更少（比如 10 秒一次）：崩溃丢失数据更多，恢复后玩家状态差异更大，体验更差。
+
+1 秒是一个合理的平衡点，参考 etcd 的 WAL 策略（批量 + 周期性 fdatasync）。
 
 ---
 
@@ -188,40 +196,37 @@ if now := nowMS(); now-w.lastSync >= config.WalSyncIntervalMS {
 
 **回答：**
 
-快照保存流程（`snapshotSave`）是：
+`snapshotSave` 的执行顺序是：
 
-1. 先把快照数据写入临时文件 `room_N.snap.tmp`
-2. 原子 rename 替换 `room_N.snap`（rename 是原子操作，中间崩溃要么旧快照还在要么新快照完整）
-3. 更新 `lastSnapshotTime`
-4. **此后再**截断 WAL 并写入 CHECKPOINT 记录（包含快照时刻的完整玩家状态）
+1. `writeJSONAtomic()` — 先写临时文件 `room_N.snap.tmp`，再 `os.Rename` 原子替换 `room_N.snap`
+2. 更新 `lastSnapshotTime`
+3. **此后才** `w.truncate()` 清空 WAL
+4. 向新 WAL 写入 `CHECKPOINT`（房间名/毒圈）+ 每个玩家的 `PLAYER_JOIN`（完整状态）+ 所有道具的 `ITEM_SPAWN` + `POISON_SHRINK`
+5. `w.sync()` 强制落盘
 
-关键设计：**先原子写快照，再截断 WAL**。如果在第 2 步和第 4 步之间崩溃：
-- 新快照已完整落盘
-- WAL 还没截断，仍然完整
-- 恢复时用新快照 + 完整 WAL 重放，完全没问题
+关键设计：**先原子写快照，再截断 WAL**。分析各个崩溃窗口：
 
-如果在 WAL 截断后崩溃：
-- 快照是完整的
-- WAL 里有 CHECKPOINT 记录，包含快照时刻的完整状态
-- 之后的事件可以继续重放
+| 崩溃时机 | 结果 |
+|---------|------|
+| 步骤 1 之中 | `.tmp` 是垃圾文件，旧 `.snap` 完好，WAL 完整 → 正常恢复 |
+| 步骤 1-3 之间 | 新快照完整，WAL 未截断仍完整 → 正常恢复（重放略多） |
+| 步骤 3-5 之间 | **这是唯一有风险的窗口**：WAL 已被清空但完整状态还没写完，若此刻崩溃会丢失该房间的可恢复数据 |
 
-所以这个顺序保证了任何时刻崩溃都能恢复，没有窗口期。
+第三种情况是当前实现的一个已知缺陷。更严谨的做法是**先写新 WAL 再删旧 WAL**（类似双缓冲/WAL 分段），或者在截断前确保快照可作为恢复源。我在项目里选择了较简单的实现，因为这个窗口极短（几个 `bufio` 写入，无 fsync，微秒级），且崩溃后玩家可以重新开局——对课程项目规模是可接受的权衡。这也是我如果重做会优先改进的点。
 
 ---
 
-### Q12：为什么要在 WAL 里存完整的玩家状态（而不只记录操作）？
+### Q12：为什么 WAL 里要存完整的玩家状态（而不只记录操作）？
 
 **回答：**
 
-这是一个工程实用性的权衡。
+因为 WAL 被截断后，必须自包含才能独立恢复。
 
-纯粹按操作重放的方式在理论上是最小化存储的，但有几个问题：
+如果只记录增量操作，重放必须从 `GAME_START` 开始，那 WAL 就永远不能截断，会无限增长。截断的前提是：**截断点要有一份完整状态**。这就是快照保存时向新 WAL 写入 `CHECKPOINT + 每玩家 PLAYER_JOIN + 所有 ITEM_SPAWN + POISON_SHRINK` 的原因——这几条记录合起来等价于一个"WAL 内嵌的快照"，后续增量操作在此基础上重放。
 
-1. **初始状态依赖**：WAL 重放必须从 `GAME_START` 的 `PLAYER_JOIN` 记录重建初始状态，随着对局进行，需要重放的记录越来越多。
+有个值得一提的细节：`CHECKPOINT` 记录本身只存 `snapshot_time/room_name/poison_radius`，**真正的玩家状态在紧随其后的 `PLAYER_JOIN` 记录里**。`replayWAL` 处理 `PLAYER_JOIN` 时用 username 做 upsert（`applyPlayerJoin`），所以重复的 PLAYER_JOIN 会覆盖而非追加，实现了"状态重置"的语义。
 
-2. **快照截断后的独立性**：截断 WAL 后，新的 WAL 不能再从 `GAME_START` 开始，必须在截断点包含一份完整状态快照。这就是 `CHECKPOINT` 记录的作用——它存的就是所有玩家当时的完整状态（位置、HP、buff、背包），这样即使快照文件损坏，纯 WAL 也能从 CHECKPOINT 独立恢复。
-
-3. **攻击力 buff 的特殊性**：这里有一个之前修复的 Bug——buff 有过期时间，如果只记录"使用了攻击药水"，重放时不知道还剩多少时间。所以 WAL 记录里存的是 `atk_buff_remain`（剩余毫秒数），恢复时计算 `atkBuffExpire = nowMS() + remain`，才能保证恢复后的过期行为正确。
+另一个踩过的坑是**攻击力 buff 的过期时间**。buff 持续 10 秒，如果只记录"使用了攻击药水"，重放时无法知道还剩多少时间。所以 WAL 记录里存的是 `atk_buff_remain`（剩余毫秒数），恢复时计算 `atkBuffExpire = nowMS() + remain`。这个 Bug 我实际遇到过——早期版本恢复后 buff 永不过期，因为 replay 时只设了 `atk` 数值却没设过期时间戳。
 
 ---
 
@@ -229,39 +234,140 @@ if now := nowMS(); now-w.lastSync >= config.WalSyncIntervalMS {
 
 **回答：**
 
-当服务器重启后重建崩溃中的房间时，被恢复的房间会设置一个等待状态（`isRecovery = true`，`expectedPlayers = N`），在 `checkEnd()` 里的逻辑是：如果当前连接人数小于预期玩家数，且等待时间小于 `RecoveryWaitTime`（30 秒），就暂缓胜负判定，继续等待。
+服务器重启后重建的房间会带上恢复标记（`isRecovery = true`，`expectedPlayers = 存活人数`）。`checkEnd()` 里的逻辑是：如果当前在线人数 < 预期人数，且距恢复开始不足 `RecoveryWaitTime`（30 秒），就返回"继续"，暂缓胜负判定。
 
-这是为了防止一个场景：假设 3 个人在打，崩溃后只有 1 个人重连。如果立刻判定"只剩 1 人存活，胜利"，另外 2 个人还在重连路上就收到游戏结束，体验很差。等待 30 秒给了所有玩家足够的时间重新登录并接上游戏。
+这是为了防止一个具体场景：3 人对战中崩溃，重启后只有 1 人先重连。如果立刻按"只剩 1 人存活"判定胜利，另外 2 人还在重连路上就收到游戏结束，体验很差。等待 30 秒给了所有人重新登录的时间。
 
-30 秒这个数字是参考 C 原版的 `RECOVERY_WAIT_TIME` 常量，是一个实践经验值——既足够大多数人重连，又不至于让等待过久。
+超过 30 秒仍未到齐的，清除恢复标记按正常规则判定——未重连的视为放弃。
 
 ---
 
-### Q14：如果快照文件损坏，恢复还能正常工作吗？是怎么做到的？
+### Q14：如果快照文件损坏，恢复还能正常工作吗？
 
 **回答：**
 
-可以，这是有专门测试验证的（`TestRecoveryCorrectness_CorruptSnapshot`）。
+能，而且这里有个反直觉的点：**因为恢复路径本来就不读快照**。
 
-快照损坏时，`snapshotLoad()` 在 JSON 解析失败或版本号不匹配时返回 `nil`。`recoverRoom()` 检测到快照不可用后，直接走纯 WAL 重放路径（`replayWAL`）。
+`recoverRoom` 的实现只做三件事：检查 WAL 里有没有 `GAME_END`（有就说明正常结束，清理文件）、调 `replayWAL` 重建状态、检查存活人数是否 > 1。整个过程不涉及 `snapshotLoad`。
 
-WAL 之所以能独立恢复，是因为快照保存时会在 WAL 里写一条 `CHECKPOINT` 记录，里面包含所有玩家的完整状态。重放时遇到 `CHECKPOINT` 就用里面的状态覆盖之前积累的结果，等价于从那个时间点重新开始。
+所以快照损坏的影响是：
+- 恢复本身**完全不受影响**（WAL 自包含）
+- 唯一损失是那个 `.snap` 文件占用的磁盘空间
 
-所以降级恢复的代价只是：恢复的起点退回到最后一次快照前的那个 `CHECKPOINT`，而不是快照时刻，也就是多重放那 20 秒内的 WAL 记录。对于 400 条记录来说，这个开销是 350µs，完全可以接受。
+我写了 `TestRecoveryCorrectness_CorruptSnapshot` 验证这一点：写入乱码快照 + 有效 WAL，断言 `snapshotLoad` 返回 nil 但 `replayWAL` 仍能正确恢复玩家和房间名。
+
+补充一下：既然恢复不读快照，快照存在的意义是什么？它是**截断 WAL 的触发器和审计记录**——保存快照这个动作顺带把 WAL 截断并重写完整状态，这才是性能收益的来源。快照文件本身可以看作是"给运维看的状态转储"，或者为将来支持"从快照冷启动"预留的能力。
 
 ---
 
-### Q15：这套机制和数据库的 MVCC/Redo Log 有什么相似和不同？
+### Q15：这套机制和数据库的 Redo Log / Checkpoint 有什么相似和不同？
 
 **回答：**
 
 相似点：
-- WAL 的 append-only + 周期性 fsync 和数据库的 Redo Log 本质相同，都是"先写日志再修改内存，靠日志保证持久化"。
-- 快照 + WAL 的组合就是数据库的 checkpoint 机制——周期性把内存状态落到磁盘，截断不需要的旧日志。
+- WAL 的 append-only + 周期性 fsync 和数据库 Redo Log 本质相同：先写日志再改内存，靠日志保证持久化。
+- 快照触发 WAL 截断，对应数据库的 checkpoint 机制——周期性固化状态，回收不再需要的日志空间。
+- 都需要"日志自包含"才能截断，我用 CHECKPOINT + PLAYER_JOIN 实现，数据库用脏页刷盘 + LSN 记录实现。
 
 不同点：
-- 数据库的 WAL 是在 crash 后**自动重放**以恢复到 crash 前的一致状态，我们的 WAL 恢复后需要**等待玩家重连**才能继续（因为游戏是多人交互的，不能单方面重建完整状态）。
-- 数据库的事务语义要求操作原子性，我们的 WAL 是尽力而为的——在两次 fsync 之间崩溃会丢失最近 1 秒的操作记录，这对数据库不可接受但对游戏可以接受。
-- MVCC 管理的是多版本并发读取，我们不需要多版本，只需要最新状态，所以没有版本管理的复杂性。
+- **恢复终点不同**：数据库 crash recovery 后能自动回到崩溃前的完整一致状态；我们恢复后是"半成品"，必须等玩家重连才能继续，因为游戏状态还包含未持久化的客户端连接。
+- **持久化强度不同**：数据库事务提交必须 fsync（否则违反 D），我们是 1 秒批量 fsync，允许丢失最近 1 秒——游戏可以接受，数据库不行。
+- **没有 MVCC 需求**：我们只需要最新状态，不需要多版本快照读，省掉了版本链和可见性判断的复杂度。
+- **没有 undo**：数据库需要 undo log 回滚未提交事务；游戏操作一旦执行就是既定事实，不存在回滚。
 
-这是一个"够用原则"的设计，用更简单的实现覆盖了核心需求。
+总的说这是"够用原则"的设计：借用了数据库最核心的 WAL + checkpoint 思路，砍掉了 ACID 中游戏场景不需要的部分。
+
+---
+
+## 四、并发与工程实践（延伸追问）
+
+> 这部分不在简历正文里，但面试官看到"Go 游戏服务器"几乎一定会追问。
+
+### Q16：一个房间的游戏循环是怎么跑的？为什么用 Ticker 而不是 Sleep？
+
+**回答：**
+
+每个房间在 `startGame` 后启动一个独立 goroutine 跑 `gameLoop`，用 `time.NewTicker(50ms)` 驱动。每 tick 依次执行：更新 buff → 毒圈缩小判定 → 毒圈伤害 → 刷新道具 → 道具过期 → 保存快照（条件满足时）→ 胜负判定 → 广播状态。
+
+一开始我用的是 `time.Sleep(50ms)`，后来改成 `Ticker`，原因是：
+
+- `Sleep(50ms)` 的实际周期是 `50ms + 本次 tick 的处理耗时`，会**累积漂移**。如果每 tick 处理花 5ms，实际周期变成 55ms，20Hz 掉到 18Hz，长时间运行后游戏节奏明显变慢。
+- `Ticker` 按固定时间点触发，处理耗时不影响下次触发时刻。而且如果某次处理超过 50ms，Ticker 会**丢弃**错过的 tick 而不是堆积补偿——这正是游戏想要的行为（宁愿掉帧也不要突然快进）。
+
+---
+
+### Q17：慢客户端会不会拖慢整个房间？怎么处理背压？
+
+**回答：**
+
+这是我实际踩过的一个坑。每个 Player 有一个 `out chan *protocol.Frame`（缓冲 256）和一个专职的 `writeLoop` goroutine 消费它，这样广播时不会在锁内做 socket I/O。
+
+但最初 `Send` 的实现是阻塞写 channel：
+```go
+select {
+case p.out <- f:
+case <-p.done:
+}
+```
+问题是：如果某个客户端不读数据（网络卡死但 TCP 连接没断），256 个缓冲填满后 `Send` 就**阻塞了调用方**。而调用方往往是房间的 `gameLoop` goroutine——一个慢客户端会冻结整个房间所有玩家的游戏。
+
+修复方案是加 `default` 分支，改成非阻塞：
+```go
+select {
+case p.out <- f:
+case <-p.done:
+default:
+    p.shutdown()  // 缓冲满 = 客户端已经落后 ~13 秒，直接踢
+}
+```
+缓冲满意味着客户端落后了 256 帧（约 13 秒），基本可以判定已经掉线。直接关闭连接，读 goroutine 会解除阻塞并走正常的清理流程。这是典型的"快速失败优于拖累全局"。
+
+---
+
+### Q18：锁的设计是怎样的？怎么保证不死锁？
+
+**回答：**
+
+三层锁：
+1. `Server.pmu` / `Server.rmu`（RWMutex）保护玩家表和房间表
+2. `Room.mu` 保护房间内状态（成员列表、道具、毒圈、WAL 指针）
+3. `Player.mu` 保护玩家字段（坐标、HP、背包、buff）
+
+死锁预防靠两条硬性规则：
+- **固定锁顺序**：需要同时持有时，一律 `room.mu` → `player.mu`，绝不反向。
+- **注册表锁是叶子锁**：持有 `pmu`/`rmu` 时不允许再获取任何其他锁，用完立即释放。
+
+另外还有一条实践约束：**socket 写入必须在锁外**。`broadcast` 的实现是先在 `room.mu` 内快照出成员列表，释放锁后再逐个 `Send`——因为 `Send` 内部可能触发 `shutdown()`，如果在锁内调用会有重入风险。
+
+我还做了一次静态并发审查（因为 Windows 无 cgo 跑不了 `-race`），发现了一个真实的数据竞争：`snapshotSave` 在锁外读 `r.wal` 字段，而 `destroyRoom` 会在锁内把它置 nil。修复方式是在锁内把指针捕获到局部变量再用。
+
+---
+
+### Q19：Room 里为什么存 `[]*Player` 而不是 `[]int` 玩家 ID？
+
+**回答：**
+
+最早的实现是 `playerIDs [10]int`（照搬 C 版的设计），每次用到玩家时通过 `findPlayerByID(id)` 查全局 map。后来改成了 `members [10]*Player` 直接存指针。
+
+改的原因是热路径开销：`gameLoop` 每 tick 要遍历玩家做 buff 更新、毒圈伤害、胜负判定、状态广播，4 处地方各自都要 `make([]int, ...)` 分配一次切片 + 对每个玩家调一次 `findPlayerByID`（每次都要抢 `pmu.RLock`）。20Hz × 4 处 × N 玩家的重复查表和分配完全没必要。
+
+改成指针后，`membersLocked()` 在房间锁内直接返回 `[]*Player`，省掉了每 tick 的 map 查找和注册表锁竞争。这次重构删了 124 行加了 56 行，同时保留了原来的 slot 语义（nil 表示空位），因为崩溃恢复逻辑依赖固定槽位。
+
+---
+
+### Q20：项目里的测试是怎么组织的？怎么验证这些优化真的有效？
+
+**回答：**
+
+分三类：
+
+**协议/单元层**：`codec_test.go` 验证 protobuf 帧和 9 种 GameEvent oneof 的序列化往返；`storage_test.go` 验证 SQLite 账号存储、战绩累加、bcrypt 升级路径。
+
+**集成层**：`server_test.go` 的 `TestDualProtocolE2E` 走完整流程——HTTP 注册/登录 → TCP Auth → HTTP 创房/加入/准备 → TCP 收 GameStart/GameState → TCP 发 Move/Attack → 收 AttackEvent。用 `httptest.NewServer` + `net.Listen(":0")` 随机端口，测试间完全隔离。
+
+**优化效果验证**（这是我特意做的，为了让简历数字有依据）：
+- 脏检测：写了个 `countingConn` 包装 `net.Conn` 统计字节数，测量空闲 2 秒的收帧数和流量——实测 0 帧 / 0 字节，对照理论值 40 帧 / 8KB。
+- 恢复性能：写了 `generateWAL(tb, roomID, nRecords)` 生成不同规模的仿真 WAL（100/500/2000/6000 条），用 `go test -bench` 测 `replayWAL` 耗时，得到 128µs → 3.36ms 的线性增长曲线，对比截断后的 400 条只需 350µs。
+- 恢复正确性：5 个用例覆盖 WAL+快照场景、纯 WAL 全量重放、buff 过期持久化、快照损坏降级、快照 JSON 字段完整性。
+
+一共 17 个测试 + 2 个 benchmark。我认为**能量化的优化才值得写进简历**，所以专门补了这套测试。
