@@ -13,7 +13,7 @@ D:\project\ASCIIGame\                       ← C 源码 + 移植文档
 
 移植到 Linux 时，将整个 `asciigame-go/` 目录复制过去即可（自包含），`PORTING_CHECKLIST.md` 和 `TECH_STACK.md` 也复制过去作为参考。
 
-## 当前状态（2026-07-20）
+## 当前状态（最后更新 2026-08-03）
 
 | 阶段 | 状态 | 里程碑 |
 |------|------|--------|
@@ -35,49 +35,56 @@ asciigame-go/
 │   ├── server.exe                  # (Windows) 或 server (Linux)
 │   └── client.exe                  # (Windows) 或 client (Linux)
 ├── cmd/
-│   ├── server/main.go              # 服务端入口
-│   └── client/main.go              # 客户端入口
+│   ├── server/main.go              # 服务端入口（TCP + HTTP）
+│   └── client/main.go              # 客户端 TUI 入口（tcell+tview）
 ├── internal/
 │   ├── config/config.go            # 常量（照抄 C config.h）
 │   ├── protocol/
-│   │   ├── protocol.go             # 协议编解码
-│   │   └── protocol_test.go        # 对标测试（golden vectors）
+│   │   ├── asciigame.proto         # protobuf schema（TCP 线格式）
+│   │   ├── asciigame.pb.go         # protoc 生成
+│   │   ├── codec.go                # protobuf ↔ 4 字节长度前缀帧编解码
+│   │   └── codec_test.go           # 帧往返 / oneof 往返测试
 │   ├── server/
 │   │   ├── server.go               # Server 聚合 + Accept 循环 + 连接处理
 │   │   ├── server_test.go          # 双人对战集成测试
 │   │   ├── player.go               # Player 结构 + 状态机 + 线程安全发送
 │   │   ├── room.go                 # Room 结构 + 状态机 + 玩家增删
-│   │   ├── handler.go              # 命令路由 + 全部 handler
+│   │   ├── handler.go              # TCP 命令路由（Move/Attack/UseItem）
 │   │   ├── game.go                 # 游戏 tick goroutine + 移动/攻击/道具/毒圈/结束
 │   │   ├── gamemap.go              # 地图模板、碰撞、随机位、距离、毒圈判定
-│   │   ├── storage.go              # 用户账号（JSON + SHA256）
-│   │   ├── wal.go                  # 文本 WAL（兼容 C 格式）
-│   │   ├── snapshot.go             # JSON 快照
+│   │   ├── storage.go              # 用户账号（SQLite + bcrypt，兼容旧 JSON/SHA256 迁移）
+│   │   ├── http.go                 # Gin HTTP API（注册/登录/房间/聊天）
+│   │   ├── token.go                # 登录 token 生成 / 校验
+│   │   ├── wal.go                  # 文本 WAL（兼容 C 格式 TS|SEQ|ROOM|ACTION|DATA）
+│   │   ├── snapshot.go             # JSON 快照（原子写）
 │   │   ├── recovery.go             # 崩溃恢复 + 登录重连
-│   │   └── recovery_test.go        # 崩溃恢复单测
+│   │   ├── recovery_bench_test.go # 恢复性能基准
+│   │   └── recovery_correctness_test.go # 恢复正确性单测
 │   └── client/
-│       ├── net.go                  # TCP 连接 + 读帧 goroutine → channel
+│       ├── net.go                  # HTTP client + TCP 连接（protobuf 帧）
 │       ├── state.go                # GameState 镜像 + 消息解析
 │       ├── ui.go                   # tview 四面板 UI
-│       └── client_test.go          # 双客户端完整对战测试
+│       └── debug.go                # 调试 / 无 TTY 模式
 └── data/                           # 运行时产物（gitignore）
-    ├── users.json                  # 用户数据
-    └── wal/                        # WAL + snapshot 文件
+    ├── game.db                     # SQLite 用户数据库
+    └── wal/                        # WAL（*.wal）+ snapshot（*.snap）
 ```
 
 ## Go 依赖
 
 ```
 require (
-    github.com/gdamore/tcell/v2 v2.13.10
-    github.com/rivo/tview v0.42.0
-    github.com/gdamore/encoding v1.0.1    // indirect
-    github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
-    github.com/rivo/uniseg v0.4.7         // indirect
-    golang.org/x/sys v0.38.0             // indirect
-    golang.org/x/term v0.37.0            // indirect
-    golang.org/x/text v0.31.0            // indirect
+    github.com/gin-gonic/gin v1.10.1                           # HTTP API
+    google.golang.org/protobuf v1.36.9                         # TCP 线格式（protobuf）
+    golang.org/x/crypto v0.54.0                                # bcrypt 密码哈希
+    github.com/modernc.org/sqlite v1.55.0                      # 纯 Go SQLite（无 cgo）
+    github.com/gdamore/tcell/v2 v2.9.0                         # 终端 UI
+    github.com/rivo/tview v0.0.0-20250107065808-5ceddf953ab8   # 终端 UI 组件
 )
+# 其余（gin-contrib/sse、klauspost/compress、mattn/go-isatty、jinzhu/copier、
+# spf13/pflag、google/uuid、gdamore/encoding、lucasb-eyer/go-colorful、
+# golang.org/x/sys、golang.org/x/term、golang.org/x/text 等）均为传递依赖
+# （// indirect），完整列表见 go.mod。
 ```
 
 迁移到 Linux 后，运行 `go mod tidy` 确保 `go.sum` 一致。
@@ -85,6 +92,8 @@ require (
 ## 阶段 4 待办清单
 
 **大部分已完成**（2026-08-01）：代码审查（`/code-review` 修复内存泄漏 + tick 分配）、性能基准、CLAUDE.md、GOGC 调优、慢客户端/优雅关闭/战绩/bcrypt/Ticker/Room []*Player 重构、以及一次静态并发审查（发现并修复了 snapshotSave 对 r.wal 字段的 off-lock 读竞争）。**唯一仍需 Linux 的是 4.1 的 `go test -race`**（Windows 无 cgo）。
+
+> **注意**：本文早期版本描述旧的"换行分隔文本协议"和"JSON+SHA256 账号"，现已作废。TCP 线协议已迁移为 **protobuf + 4 字节长度前缀**（见 CLAUDE.md 与 `internal/protocol/`），账号存储迁移为 **SQLite + bcrypt**（兼容旧 JSON/SHA256 数据自动迁移）。下文"TCP 线协议"小节为当前事实。
 
 ### 4.1 竞态检测（必须在 Linux 上跑）
 
@@ -105,7 +114,7 @@ PYTHONUTF8=1 python ../test/robustness_test.py --port 8888
 用 `/code-review` 和 `/simplify` 对代码做一次系统性检查，重点关注：
 - 锁序是否一致（`room.mu` → `player.mu`，注册表锁为叶子锁）
 - goroutine 泄漏（每个房间的 gameLoop 是否正确退出）
-- 协议格式是否与 C 版逐字节一致（已有 golden vector 测试覆盖）
+- 线协议为 protobuf（4 字节长度前缀帧），需保持 schema 向后兼容；帧往返 / oneof 往返测试见 `internal/protocol/codec_test.go`
 
 ### 4.3 性能基准
 ```bash
@@ -128,26 +137,27 @@ go test -bench=. ./internal/protocol/ -run=NONE
 ```
 验证：登录/建房/加入/准备 → 对战（移动 WASD、攻击 J/空格、道具 1-5、聊天 T）→ 毒圈收缩 → 对局结束。
 
-## 协议红线（不可改动）
+## TCP 线协议（不可改动）
 
-帧格式：`CMD|arg1|arg2|...\n`，`|` 分隔，`\n` 结尾。解析时先剥 `\r\n`，按 `|` 切分，**空 token 被丢弃**（`ATTACK|\n` → argc=0）。
+线格式为 **protobuf + 4 字节大端长度前缀帧**（见 `internal/protocol/asciigame.proto` 与 `codec.go`）。每帧 = `len(4B 大端) || protobuf(Frame)`。旧的"换行分隔文本协议"已被替换，**不要回退**。
 
-GAME_STATE 玩家条目是 **13 字段**：
-`id,x,y,hp,atk,def,status,shield,inv0,inv1,inv2,inv3,inv4`
+`Frame.Payload` 为 oneof，支持：
+- 客户端→服务端：`Auth` / `Move` / `Attack` / `UseItem`
+- 服务端→客户端：`Ok` / `Error` / `GameStart` / `GameState` / `GameEvent` / `GameEnd` / `ChatMsg` / `Kick` / `PlayerJoin` / `PlayerLeave` / `RoomInfo` / `RoomList` / `MapData`
 
-登录成功是 `OK|Login successful|<player_id>\n`（额外参数）。
+完整 schema 与构造器（`NewGameState` / `New*Event` 等）见 `internal/protocol/`，往返测试见 `codec_test.go`。
 
-完整格式参考 `internal/protocol/protocol_test.go` 中的 golden vectors。
+> **WAL 仍为文本格式** `TS|SEQ|ROOM|ACTION|DATA\n`（与 C 版兼容），见 `wal.go` 与下方"关键设计决策 4"。WAL 是内部持久化格式，**不属于 TCP 线协议**。
 
 ## 关键设计决策（备忘）
 
 1. **并发模型**：每连接一 goroutine + 每房间一 `Ticker(50ms)` goroutine；全局 `players`/`rooms` 表用 `sync.RWMutex`；玩家写用独立的 `out chan` + writeLoop goroutine 串行化
 2. **锁序**：`room.mu` → `player.mu`，注册表锁为叶子锁；所有网络发送在锁外
-3. **行分帧**：服务端用 `bufio.Reader.ReadString('\n')`（非 Scanner，避 64KB 上限）
+3. **行分帧**：TCP 服务端用 **4 字节大端长度前缀 + protobuf 解码**（`protocol.ReadFrame`），不再使用文本行分帧
 4. **WAL 格式**：文本格式 `TS|SEQ|ROOM|ACTION|DATA\n`，与 C 版兼容
 5. **快照格式**：JSON（`encoding/json`），每 20s 一次，原子写入
 6. **恢复语义**：启动扫描 WAL，无 GAME_END 的房间挂起恢复表；玩家登录时逐个重连；首个重连者创建 gaming 房间启动游戏循环；等待 `RecoveryWaitTime`(30s) 期满前不判胜负
-7. **C bug 修正**：`game_update_buffs` 发送的 BUFF_EXPIRED/BUFF_WARNING 缺少尾部 `\n`，Go 版发送正确终止的帧
+7. **事件传输**：BUFF_WARNING/BUFF_EXPIRED 等事件通过 protobuf oneof（`GameEvent`）传输，不再依赖文本帧的尾部 `\n`
 
 ## 已知环境差异
 
@@ -185,4 +195,4 @@ go build -o bin/client ./cmd/client
 
 - `D:\project\ASCIIGame\PORTING_CHECKLIST.md` — C 模块清单与移植清单
 - `D:\project\ASCIIGame\TECH_STACK.md` — deep-research 技术选型报告
-- `C:\Users\Administrator\.tclaude\plans\melodic-rolling-fern.md` — 批准的架构方案
+- `C:\Users\Administrator\.tclaude\plans\melodic-rolling-fern.md` — 批准的架构方案（机器相关路径，仅本机有效）
